@@ -1,0 +1,69 @@
+pipeline {
+    agent {
+        label 'ci-agent'
+    }
+
+    environment {
+        REGISTRY = 'ghcr.io/namle1602'
+        IMAGE_NAME = 'devops-flask-app'
+        IMAGE_TAG = "${env.BUILD_NUMBER}"
+        FULL_IMAGE = "${REGISTRY}/${IMAGE_NAME}:${IMAGE_TAG}"
+        LATEST_IMAGE = "${REGISTRY}/${IMAGE_NAME}:latest"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'github-deploy-key',
+                    url: 'git@github.com:namle1602/devops-project.git'
+            }
+        }
+
+        stage('Install Dependencies & Unit Test') {
+            steps {
+                dir('app') {
+                    sh '''
+                        python3 -m venv venv
+                        . venv/bin/activate
+                        pip install --upgrade pip
+                        pip install -r requirements.txt
+                        python3 -m pytest tests/test_app.py -v
+                    '''
+                }
+            }
+        }
+
+        stage('Build Image with Podman') {
+            steps {
+                dir('app') {
+                    sh '''
+                        podman --cgroup-manager=cgroupfs build -t ${FULL_IMAGE} -t ${LATEST_IMAGE} .
+                    '''
+                }
+            }
+        }
+
+        stage('Push Image to GHCR') {
+            steps {
+                withCredentials([usernamePassword(
+                    credentialsId: 'ghcr-credentials',
+                    usernameVariable: 'GHCR_USER',
+                    passwordVariable: 'GHCR_TOKEN'
+                )]) {
+                    sh '''
+                        echo "${GHCR_TOKEN}" | podman login ghcr.io -u "${GHCR_USER}" --password-stdin
+                        podman --cgroup-manager=cgroupfs push ${FULL_IMAGE}
+                        podman --cgroup-manager=cgroupfs push ${LATEST_IMAGE}
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'podman logout ghcr.io || true'
+        }
+    }
+}
