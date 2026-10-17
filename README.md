@@ -65,3 +65,5 @@ Các thành viên truy cập từ xa thông qua Tailscale sau khi hạ tầng đ
 **Giai đoạn hiện tại:** Khởi tạo GitHub repository và chuẩn bị hạ tầng.
 
 Các thành viên có thể bắt đầu phát triển phần việc riêng. Việc triển khai tích hợp sẽ thực hiện khi VM và mạng sẵn sàng.
+
+CI auto-trigger verification.
