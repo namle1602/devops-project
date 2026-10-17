@@ -1,0 +1,33 @@
+
+pipeline {
+    agent {
+        label 'ci-agent'
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'github-deploy-key',
+                    url: 'git@github.com:namle1602/devops-project.git'
+            }
+        }
+
+        stage('Verify Kubernetes Connection') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    sh '''
+                        kubectl get pods -n devops-project
+                        kubectl auth can-i create deployments \
+                            -n devops-project
+                    '''
+                }
+            }
+        }
+    }
+}
