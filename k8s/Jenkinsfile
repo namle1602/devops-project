@@ -6,6 +6,14 @@ pipeline {
 
     stages {
         stage('Checkout') {
+            
+stage('Verify Image Tag') {
+    steps {
+        echo "Received IMAGE_TAG: ${params.IMAGE_TAG}"
+        echo "Image to deploy: ghcr.io/namle1602/devops-flask-app:${params.IMAGE_TAG}"
+    }
+}
+
             steps {
                 git branch: 'main',
                     credentialsId: 'github-deploy-key',
