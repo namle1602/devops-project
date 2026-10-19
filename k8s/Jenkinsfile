@@ -36,43 +36,66 @@ pipeline {
             }
         }
 
-        // ===== STAGE MỚI: DEPLOY TO KUBERNETES =====
-        stage('Deploy to Kubernetes') {
-            steps {
-                withCredentials([
-                    file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
-                        variable: 'KUBECONFIG'
-                    )
-                ]) {
-                    sh '''
-                        set -eu
+        
+stage('Deploy to Kubernetes') {
+    steps {
+        withCredentials([
+            file(
+                credentialsId: 'k3s-jenkins-kubeconfig',
+                variable: 'KUBECONFIG'
+            )
+        ]) {
+            sh '''
+                set -eu
 
-                        IMAGE="ghcr.io/namle1602/devops-flask-app:${IMAGE_TAG}"
+                IMAGE="ghcr.io/namle1602/devops-flask-app:${IMAGE_TAG}"
 
-                        echo "Applying Kubernetes manifests..."
-                        kubectl apply -f k8s/deployment.yaml \
-                                      -f k8s/service.yaml \
-                                      -n devops-project
+                echo "Validating image tag..."
+                case "${IMAGE_TAG}" in
+                    ""|*[!a-zA-Z0-9_.-]*)
+                        echo "ERROR: Invalid IMAGE_TAG"
+                        exit 1
+                        ;;
+                esac
 
-                        echo "Updating Deployment image to ${IMAGE}..."
-                        kubectl set image deployment/flask-deployment \
-                            flask-app="${IMAGE}" \
-                            -n devops-project
+                echo "Deploying image: ${IMAGE}"
 
-                        echo "Waiting for rolling update..."
-                        kubectl rollout status deployment/flask-deployment \
-                            -n devops-project \
-                            --timeout=180s
+                echo "Applying Service..."
+                kubectl apply -f k8s/service.yaml \
+                    -n devops-project
 
-                        echo "Deployment status:"
-                        kubectl get deployments,pods,services \
-                            -n devops-project
-                    '''
-                }
-            }
+                echo "Rendering Deployment with the requested image..."
+                sed "s|ghcr.io/namle1602/devops-flask-app:latest|${IMAGE}|g" \
+                    k8s/deployment.yaml > deployment-rendered.yaml
+
+                echo "Applying Deployment..."
+                kubectl apply -f deployment-rendered.yaml \
+                    -n devops-project
+
+                echo "Waiting for rolling update..."
+                kubectl rollout status deployment/flask-deployment \
+                    -n devops-project \
+                    --timeout=180s
+
+                echo "Verifying deployed image..."
+                DEPLOYED_IMAGE=$(kubectl get deployment flask-deployment \
+                    -n devops-project \
+                    -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+                if [ "${DEPLOYED_IMAGE}" != "${IMAGE}" ]; then
+                    echo "ERROR: Deployed image does not match requested image"
+                    exit 1
+                fi
+
+                echo "Deployment image verified: ${DEPLOYED_IMAGE}"
+
+                kubectl get deployments,pods,services \
+                    -n devops-project
+            '''
         }
-        // ===== KẾT THÚC STAGE MỚI =====
+    }
+}
+
 
     }
 }
