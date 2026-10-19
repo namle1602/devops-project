@@ -1,4 +1,3 @@
-
 pipeline {
     agent {
         label 'ci-agent'
@@ -36,5 +35,44 @@ pipeline {
                 }
             }
         }
+
+        // ===== STAGE MỚI: DEPLOY TO KUBERNETES =====
+        stage('Deploy to Kubernetes') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        IMAGE="ghcr.io/namle1602/devops-flask-app:${IMAGE_TAG}"
+
+                        echo "Applying Kubernetes manifests..."
+                        kubectl apply -f k8s/deployment.yaml \
+                                      -f k8s/service.yaml \
+                                      -n devops-project
+
+                        echo "Updating Deployment image to ${IMAGE}..."
+                        kubectl set image deployment/flask-deployment \
+                            flask-app="${IMAGE}" \
+                            -n devops-project
+
+                        echo "Waiting for rolling update..."
+                        kubectl rollout status deployment/flask-deployment \
+                            -n devops-project \
+                            --timeout=180s
+
+                        echo "Deployment status:"
+                        kubectl get deployments,pods,services \
+                            -n devops-project
+                    '''
+                }
+            }
+        }
+        // ===== KẾT THÚC STAGE MỚI =====
+
     }
 }
