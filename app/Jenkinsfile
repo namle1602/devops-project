@@ -61,6 +61,23 @@ pipeline {
         }
     }
 
+    
+stage('Trigger CD Pipeline') {
+    steps {
+        echo "Triggering CD with IMAGE_TAG=${env.BUILD_NUMBER}"
+
+        build job: '/CD/devops-cd-pipeline',
+              parameters: [
+                  string(
+                      name: 'IMAGE_TAG',
+                      value: "${env.BUILD_NUMBER}"
+                  )
+              ],
+              wait: true,
+              propagate: true
+    }
+}
+
     post {
         always {
             sh 'podman logout ghcr.io || true'
