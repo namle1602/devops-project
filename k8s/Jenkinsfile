@@ -20,21 +20,30 @@ pipeline {
         }
 
         stage('Verify Kubernetes Connection') {
-            steps {
-                withCredentials([
-                    file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
-                        variable: 'KUBECONFIG'
-                    )
-                ]) {
-                    sh '''
-                        kubectl get pods -n devops-project
-                        kubectl auth can-i create deployments \
-                            -n devops-project
-                    '''
-                }
-            }
+    steps {
+        withCredentials([
+            file(
+                credentialsId: 'k3s-jenkins-kubeconfig',
+                variable: 'KUBECONFIG'
+            )
+        ]) {
+            sh '''
+                kubectl get pods -n devops-project
+
+                kubectl auth can-i create deployments \
+                    -n devops-project
+
+                echo "Checking Istio Gateway permission..."
+                kubectl auth can-i create gateways.networking.istio.io \
+                    -n devops-project
+
+                echo "Checking Istio VirtualService permission..."
+                kubectl auth can-i create virtualservices.networking.istio.io \
+                    -n devops-project
+            '''
         }
+    }
+}
 
         
 stage('Deploy to Kubernetes') {
