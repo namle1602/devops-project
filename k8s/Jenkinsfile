@@ -1,9 +1,11 @@
+
 pipeline {
     agent {
         label 'ci-agent'
     }
 
     stages {
+
         stage('Verify Image Tag') {
             steps {
                 echo "Received IMAGE_TAG: ${params.IMAGE_TAG}"
@@ -28,74 +30,128 @@ pipeline {
                     )
                 ]) {
                     sh '''
+                        set -eu
+
+                        echo "Checking Kubernetes connection..."
                         kubectl get pods -n devops-project
-                        kubectl auth can-i create deployments \
+
+                        echo "Checking Deployment permissions..."
+                        kubectl auth can-i create deployments.apps \
+                            -n devops-project
+
+                        echo "Checking Istio Gateway permissions..."
+                        kubectl auth can-i create gateways.networking.istio.io \
+                            -n devops-project
+
+                        echo "Checking Istio VirtualService permissions..."
+                        kubectl auth can-i create virtualservices.networking.istio.io \
                             -n devops-project
                     '''
                 }
             }
         }
 
-        
-stage('Deploy to Kubernetes') {
-    steps {
-        withCredentials([
-            file(
-                credentialsId: 'k3s-jenkins-kubeconfig',
-                variable: 'KUBECONFIG'
-            )
-        ]) {
-            sh '''
-                set -eu
+        stage('Deploy to Kubernetes') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
 
-                IMAGE="ghcr.io/namle1602/devops-flask-app:${IMAGE_TAG}"
+                        IMAGE="ghcr.io/namle1602/devops-flask-app:${IMAGE_TAG}"
 
-                echo "Validating image tag..."
-                case "${IMAGE_TAG}" in
-                    ""|*[!a-zA-Z0-9_.-]*)
-                        echo "ERROR: Invalid IMAGE_TAG"
-                        exit 1
-                        ;;
-                esac
+                        echo "Validating image tag..."
+                        case "${IMAGE_TAG}" in
+                            ""|*[!a-zA-Z0-9_.-]*)
+                                echo "ERROR: Invalid IMAGE_TAG"
+                                exit 1
+                                ;;
+                        esac
 
-                echo "Deploying image: ${IMAGE}"
+                        echo "Deploying image: ${IMAGE}"
 
-                echo "Applying Service..."
-                kubectl apply -f k8s/service.yaml \
-                    -n devops-project
+                        echo "Applying Service..."
+                        kubectl apply -f k8s/service.yaml \
+                            -n devops-project
 
-                echo "Rendering Deployment with the requested image..."
-                sed "s|ghcr.io/namle1602/devops-flask-app:latest|${IMAGE}|g" \
-                    k8s/deployment.yaml > deployment-rendered.yaml
+                        echo "Rendering Deployment with the requested image..."
+                        sed "s|ghcr.io/namle1602/devops-flask-app:latest|${IMAGE}|g" \
+                            k8s/deployment.yaml > deployment-rendered.yaml
 
-                echo "Applying Deployment..."
-                kubectl apply -f deployment-rendered.yaml \
-                    -n devops-project
+                        echo "Applying Deployment..."
+                        kubectl apply -f deployment-rendered.yaml \
+                            -n devops-project
 
-                echo "Waiting for rolling update..."
-                kubectl rollout status deployment/flask-deployment \
-                    -n devops-project \
-                    --timeout=180s
+                        echo "Waiting for rolling update..."
+                        kubectl rollout status deployment/flask-deployment \
+                            -n devops-project \
+                            --timeout=180s
 
-                echo "Verifying deployed image..."
-                DEPLOYED_IMAGE=$(kubectl get deployment flask-deployment \
-                    -n devops-project \
-                    -o jsonpath='{.spec.template.spec.containers[0].image}')
+                        echo "Verifying deployed image..."
+                        DEPLOYED_IMAGE=$(kubectl get deployment flask-deployment \
+                            -n devops-project \
+                            -o jsonpath='{.spec.template.spec.containers[0].image}')
 
-                if [ "${DEPLOYED_IMAGE}" != "${IMAGE}" ]; then
-                    echo "ERROR: Deployed image does not match requested image"
-                    exit 1
-                fi
+                        if [ "${DEPLOYED_IMAGE}" != "${IMAGE}" ]; then
+                            echo "ERROR: Deployed image does not match requested image"
+                            exit 1
+                        fi
 
-                echo "Deployment image verified: ${DEPLOYED_IMAGE}"
+                        echo "Deployment image verified: ${DEPLOYED_IMAGE}"
 
-                kubectl get deployments,pods,services \
-                    -n devops-project
-            '''
+                        echo "Checking Kubernetes resources..."
+                        kubectl get deployments,pods,services \
+                            -n devops-project
+                    '''
+                }
+            }
         }
-    }
-}
 
+        stage('Deploy Istio Configuration') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
 
+                        echo "Validating Istio Gateway..."
+                        kubectl apply --dry-run=server \
+                            -f istio/flask-gateway.yaml \
+                            -n devops-project
+
+                        echo "Validating Istio VirtualService..."
+                        kubectl apply --dry-run=server \
+                            -f istio/flask-virtualservice.yaml \
+                            -n devops-project
+
+                        echo "Applying Istio Gateway..."
+                        kubectl apply -f istio/flask-gateway.yaml \
+                            -n devops-project
+
+                        echo "Applying Istio VirtualService..."
+                        kubectl apply -f istio/flask-virtualservice.yaml \
+                            -n devops-project
+
+                        echo "Verifying Istio Gateway..."
+                        kubectl get gateways.networking.istio.io \
+                            -n devops-project
+
+                        echo "Verifying Istio VirtualService..."
+                        kubectl get virtualservices.networking.istio.io \
+                            -n devops-project
+
+                        echo "Istio configuration deployed successfully!"
+                    '''
+                }
+            }
+        }
     }
 }
