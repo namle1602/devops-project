@@ -1,0 +1,19 @@
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: flask-virtualservice
+  namespace: devops-project
+spec:
+  hosts:
+    - "*"
+  gateways:
+    - flask-gateway
+  http:
+    - match:
+        - uri:
+            prefix: /
+      route:
+        - destination:
+            host: flask-service.devops-project.svc.cluster.local
+            port:
+              number: 80
