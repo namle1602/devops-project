@@ -1,4 +1,4 @@
-
+// UC4: Pre-merge CI validation for GitHub Pull Requests
 pipeline {
     agent {
         label 'ci-agent'
