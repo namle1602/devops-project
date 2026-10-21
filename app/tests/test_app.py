@@ -22,3 +22,9 @@ def test_health_endpoint(client):
     response = client.get("/health")
     assert response.status_code == 200
     assert response.get_json() == {"status": "healthy"}
+
+def test_simulate_ci_failure(client):
+    response = client.get("/health")
+
+    # Gia lap mot yeu cau sai de kiem tra CI
+    assert response.get_json() == {"status": "unhealthy"}
