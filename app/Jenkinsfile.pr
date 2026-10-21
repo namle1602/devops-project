@@ -1,0 +1,49 @@
+// UC4: Pre-merge CI validation for GitHub Pull Requests
+pipeline {
+    agent {
+        label 'ci-agent'
+    }
+
+    options {
+        skipDefaultCheckout(true)
+    }
+
+    stages {
+        stage('Checkout Pull Request') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Unit Test') {
+            steps {
+                dir('app') {
+                    sh '''
+                        python3 -m venv venv
+                        . venv/bin/activate
+
+                        pip install -r requirements.txt --timeout 60 --retries 10
+                        python3 -m pytest tests/test_app.py -v
+                    '''
+                }
+            }
+        }
+
+        stage('Validate Container Build') {
+            steps {
+                dir('app') {
+                    sh '''
+                        podman --cgroup-manager=cgroupfs build \
+                            -t localhost/devops-flask-pr:${BUILD_NUMBER} .
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            echo "PR Validation Result: ${currentBuild.currentResult}"
+        }
+    }
+}
