@@ -4,18 +4,45 @@ pipeline {
         label 'ci-agent'
     }
 
+    options {
+        disableConcurrentBuilds()
+        timestamps()
+    }
+
+    parameters {
+        string(
+            name: 'IMAGE_TAG',
+            defaultValue: '',
+            description: 'GHCR image tag received from CI'
+        )
+    }
+
+    environment {
+        IMAGE_REPO = 'ghcr.io/namle1602/devops-flask-app'
+        STAGING_NS = 'devops-staging'
+        PRODUCTION_NS = 'devops-project'
+    }
+
     stages {
 
         stage('Verify Image Tag') {
             steps {
-                echo "Received IMAGE_TAG: ${params.IMAGE_TAG}"
-                echo "Image to deploy: ghcr.io/namle1602/devops-flask-app:${params.IMAGE_TAG}"
+                script {
+                    if (!(params.IMAGE_TAG ==~ /^[a-zA-Z0-9_][a-zA-Z0-9_.-]*$/)) {
+                        error('Invalid IMAGE_TAG')
+                    }
+
+                    env.DEPLOY_IMAGE =
+                        "${env.IMAGE_REPO}:${params.IMAGE_TAG}"
+
+                    echo "Image to deploy: ${env.DEPLOY_IMAGE}"
+                }
             }
         }
 
         stage('Checkout') {
             steps {
-                git branch: 'main',
+                git branch: (env.DEPLOY_BRANCH ?: 'main'),
                     credentialsId: 'github-deploy-key',
                     url: 'git@github.com:namle1602/devops-project.git'
             }
@@ -32,26 +59,38 @@ pipeline {
                     sh '''
                         set -eu
 
-                        echo "Checking Kubernetes connection..."
-                        kubectl get pods -n devops-project
+                        echo "=== Production ==="
+                        kubectl get deployments,pods,services \
+                            -n "${PRODUCTION_NS}"
 
-                        echo "Checking Deployment permissions..."
-                        kubectl auth can-i create deployments.apps \
-                            -n devops-project
+                        echo "=== Staging ==="
+                        kubectl get deployments,pods,services \
+                            -n "${STAGING_NS}"
 
-                        echo "Checking Istio Gateway permissions..."
-                        kubectl auth can-i create gateways.networking.istio.io \
-                            -n devops-project
+                        echo "=== Checking permissions ==="
 
-                        echo "Checking Istio VirtualService permissions..."
-                        kubectl auth can-i create virtualservices.networking.istio.io \
-                            -n devops-project
+                        for NS in "${STAGING_NS}" "${PRODUCTION_NS}"; do
+                            for RESOURCE in deployments.apps services; do
+                                for VERB in get create patch; do
+                                    RESULT=$(kubectl auth can-i \
+                                        "${VERB}" "${RESOURCE}" \
+                                        -n "${NS}")
+
+                                    if [ "${RESULT}" != "yes" ]; then
+                                        echo "Permission denied: ${VERB} ${RESOURCE} in ${NS}"
+                                        exit 1
+                                    fi
+                                done
+                            done
+                        done
+
+                        echo "Kubernetes connection verified!"
                     '''
                 }
             }
         }
 
-        stage('Deploy to Kubernetes') {
+        stage('Deploy to Staging') {
             steps {
                 withCredentials([
                     file(
@@ -62,54 +101,164 @@ pipeline {
                     sh '''
                         set -eu
 
-                        IMAGE="ghcr.io/namle1602/devops-flask-app:${IMAGE_TAG}"
+                        echo "=== Deploying to Staging ==="
+                        echo "Image: ${DEPLOY_IMAGE}"
 
-                        echo "Validating image tag..."
-                        case "${IMAGE_TAG}" in
-                            ""|*[!a-zA-Z0-9_.-]*)
-                                echo "ERROR: Invalid IMAGE_TAG"
-                                exit 1
-                                ;;
-                        esac
+                        kubectl apply \
+                            -f k8s/staging/service.yaml \
+                            -n "${STAGING_NS}"
 
-                        echo "Deploying image: ${IMAGE}"
+                        sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
+                            k8s/staging/deployment.yaml \
+                            > staging-deployment-rendered.yaml
 
-                        echo "Applying Service..."
-                        kubectl apply -f k8s/service.yaml \
-                            -n devops-project
+                        kubectl apply \
+                            -f staging-deployment-rendered.yaml \
+                            -n "${STAGING_NS}"
 
-                        echo "Rendering Deployment with the requested image..."
-                        sed "s|ghcr.io/namle1602/devops-flask-app:latest|${IMAGE}|g" \
-                            k8s/deployment.yaml > deployment-rendered.yaml
-
-                        echo "Applying Deployment..."
-                        kubectl apply -f deployment-rendered.yaml \
-                            -n devops-project
-
-                        echo "Waiting for rolling update..."
-                        kubectl rollout status deployment/flask-deployment \
-                            -n devops-project \
+                        kubectl rollout status \
+                            deployment/flask-deployment \
+                            -n "${STAGING_NS}" \
                             --timeout=180s
 
-                        echo "Verifying deployed image..."
                         DEPLOYED_IMAGE=$(kubectl get deployment flask-deployment \
-                            -n devops-project \
+                            -n "${STAGING_NS}" \
                             -o jsonpath='{.spec.template.spec.containers[0].image}')
 
-                        if [ "${DEPLOYED_IMAGE}" != "${IMAGE}" ]; then
-                            echo "ERROR: Deployed image does not match requested image"
+                        if [ "${DEPLOYED_IMAGE}" != "${DEPLOY_IMAGE}" ]; then
+                            echo "ERROR: Staging image mismatch"
                             exit 1
                         fi
 
-                        echo "Deployment image verified: ${DEPLOYED_IMAGE}"
-
-                        echo "Checking Kubernetes resources..."
-                        kubectl get deployments,pods,services \
-                            -n devops-project
+                        echo "Staging image verified: ${DEPLOYED_IMAGE}"
                     '''
                 }
             }
         }
+
+        stage('Staging Smoke Test') {
+            steps {
+                withCredentials([
+                    file(
+                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        echo "=== Staging Smoke Test ==="
+
+                        POD=$(kubectl get pods \
+                            -n "${STAGING_NS}" \
+                            -l app=flask-app \
+                            -o jsonpath='{.items[0].metadata.name}')
+
+                        if [ -z "${POD}" ]; then
+                            echo "ERROR: No Staging Pod found"
+                            exit 1
+                        fi
+
+                        kubectl exec "${POD}" \
+                            -n "${STAGING_NS}" \
+                            -- python -c '
+import urllib.request
+import json
+
+url = "http://flask-service.devops-staging.svc.cluster.local/health"
+
+with urllib.request.urlopen(url, timeout=15) as response:
+    status = response.status
+    body = json.loads(response.read().decode())
+
+print("HTTP Status:", status)
+print("Response:", body)
+
+if status != 200 or body.get("status") != "healthy":
+    raise SystemExit("Staging Smoke Test FAILED")
+
+print("Staging Smoke Test PASSED")
+'
+                    '''
+                }
+            }
+        }
+
+        stage('Approve Production Deployment') {
+            steps {
+                timeout(time: 15, unit: 'MINUTES') {
+                    input(
+                        message: "Staging passed. Deploy image ${env.DEPLOY_IMAGE} to Production?",
+                        ok: 'Deploy to Production'
+                    )
+                }
+            }
+        }
+
+        stage('Production Release') {
+            stages {
+                stage('Deploy to Production') {
+                    steps {
+                    withCredentials([
+                    file(
+                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        variable: 'KUBECONFIG'
+                    )
+                ]) {
+                    script {
+                        sh '''
+                            set -eu
+
+                            echo "=== Saving current Production image ==="
+
+                            kubectl get deployment flask-deployment \
+                                -n "${PRODUCTION_NS}" \
+                                -o jsonpath='{.spec.template.spec.containers[0].image}' \
+                                > production-previous-image.txt
+
+                            echo "Previous image:"
+                            cat production-previous-image.txt
+                        '''
+
+                        env.PRODUCTION_DEPLOY_STARTED = 'true'
+
+                            sh '''
+                                set -eu
+
+                                echo "=== Deploying to Production ==="
+
+                                kubectl apply \
+                                    -f k8s/service.yaml \
+                                    -n "${PRODUCTION_NS}"
+
+                                sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
+                                    k8s/deployment.yaml \
+                                    > production-deployment-rendered.yaml
+
+                                kubectl apply \
+                                    -f production-deployment-rendered.yaml \
+                                    -n "${PRODUCTION_NS}"
+
+                                kubectl rollout status \
+                                    deployment/flask-deployment \
+                                    -n "${PRODUCTION_NS}" \
+                                    --timeout=180s
+
+                                DEPLOYED_IMAGE=$(kubectl get deployment flask-deployment \
+                                    -n "${PRODUCTION_NS}" \
+                                    -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+                                if [ "${DEPLOYED_IMAGE}" != "${DEPLOY_IMAGE}" ]; then
+                                    echo "ERROR: Production image mismatch"
+                                    exit 1
+                                fi
+
+                                echo "Production image verified: ${DEPLOYED_IMAGE}"
+                            '''
+                        }
+                    }
+                }
+            }
 
         stage('Deploy Istio Configuration') {
             steps {
@@ -122,36 +271,139 @@ pipeline {
                     sh '''
                         set -eu
 
-                        echo "Validating Istio Gateway..."
+                        echo "=== Validating Istio ==="
+
                         kubectl apply --dry-run=server \
                             -f istio/flask-gateway.yaml \
-                            -n devops-project
+                            -n "${PRODUCTION_NS}"
 
-                        echo "Validating Istio VirtualService..."
                         kubectl apply --dry-run=server \
                             -f istio/flask-virtualservice.yaml \
-                            -n devops-project
+                            -n "${PRODUCTION_NS}"
 
-                        echo "Applying Istio Gateway..."
-                        kubectl apply -f istio/flask-gateway.yaml \
-                            -n devops-project
+                        echo "=== Applying Istio ==="
 
-                        echo "Applying Istio VirtualService..."
-                        kubectl apply -f istio/flask-virtualservice.yaml \
-                            -n devops-project
+                        kubectl apply \
+                            -f istio/flask-gateway.yaml \
+                            -n "${PRODUCTION_NS}"
 
-                        echo "Verifying Istio Gateway..."
+                        kubectl apply \
+                            -f istio/flask-virtualservice.yaml \
+                            -n "${PRODUCTION_NS}"
+
                         kubectl get gateways.networking.istio.io \
-                            -n devops-project
+                            -n "${PRODUCTION_NS}"
 
-                        echo "Verifying Istio VirtualService..."
                         kubectl get virtualservices.networking.istio.io \
-                            -n devops-project
+                            -n "${PRODUCTION_NS}"
 
                         echo "Istio configuration deployed successfully!"
                     '''
                 }
             }
+        }
+
+                stage('Production Smoke Test') {
+            steps {
+                sh '''
+                    set -eu
+
+                    echo "=== Production Smoke Test ==="
+
+                    RESPONSE=$(curl --fail --silent --show-error \
+                        --max-time 15 \
+                        http://100.101.165.112:30500/health)
+
+                    echo "Response: ${RESPONSE}"
+
+                    if [ "${RESPONSE}" != '{"status":"healthy"}' ]; then
+                        echo "ERROR: Production health response is invalid"
+                        exit 1
+                    fi
+
+                    echo "Production Smoke Test PASSED"
+                '''
+            }
+        }
+    } // Kết thúc stages của Production Release
+    post {
+        failure {
+            script {
+                if (env.PRODUCTION_DEPLOY_STARTED == 'true') {
+                    echo 'Production Release FAILED. Attempting image rollback.'
+
+                    withCredentials([
+                        file(
+                            credentialsId: 'k3s-jenkins-kubeconfig',
+                            variable: 'KUBECONFIG'
+                        )
+                    ]) {
+                        sh '''
+                            set -eu
+
+                            echo "=== Rolling back Production image ==="
+
+                            PREVIOUS_IMAGE=$(cat production-previous-image.txt)
+
+                            if [ -z "${PREVIOUS_IMAGE}" ]; then
+                                echo "ERROR: Previous image is empty"
+                                exit 1
+                            fi
+
+                            kubectl set image \
+                                deployment/flask-deployment \
+                                "flask-app=${PREVIOUS_IMAGE}" \
+                                -n "${PRODUCTION_NS}"
+
+                            kubectl rollout status \
+                                deployment/flask-deployment \
+                                -n "${PRODUCTION_NS}" \
+                                --timeout=180s
+
+                            CURRENT_IMAGE=$(kubectl get deployment flask-deployment \
+                                -n "${PRODUCTION_NS}" \
+                                -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+                            if [ "${CURRENT_IMAGE}" != "${PREVIOUS_IMAGE}" ]; then
+                                echo "ERROR: Rollback image mismatch"
+                                exit 1
+                            fi
+
+                            echo "=== Verifying Production health ==="
+
+                            RESPONSE=$(curl --fail --silent --show-error \
+                                --max-time 15 \
+                                http://100.101.165.112:30500/health)
+
+                            echo "Response: ${RESPONSE}"
+
+                            if [ "${RESPONSE}" != '{"status":"healthy"}' ]; then
+                                echo "ERROR: Production health check failed after rollback"
+                                exit 1
+                            fi
+
+                            echo "Production image rollback verified successfully!"
+                        '''
+                    }
+                } else {
+                    echo 'Production deployment was not started. Skipping rollback.'
+                }
+            }
+        }
+    }
+        }// Kết thúc Production Release
+    } // Kết thúc stages của Pipeline
+    post {
+        success {
+            echo "CD Pipeline SUCCESS: ${env.DEPLOY_IMAGE}"
+        }
+
+        failure {
+            echo "CD Pipeline FAILED. Review logs and rollback status."
+        }
+
+        aborted {
+            echo "CD Pipeline ABORTED."
         }
     }
 }
