@@ -21,6 +21,7 @@ pipeline {
         IMAGE_REPO = 'ghcr.io/namle1602/devops-flask-app'
         STAGING_NS = 'devops-staging'
         PRODUCTION_NS = 'devops-rollback-test'
+        ROLLBACK_TEST_IMAGE = 'ghcr.io/namle1602/devops-flask-app:rollback-test-invalid-999'
     }
 
     stages {
@@ -231,7 +232,7 @@ print("Staging Smoke Test PASSED")
     -f k8s/rollback-test/service.yaml \
     -n "${PRODUCTION_NS}"
 
-sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
+sed "s|${IMAGE_REPO}:latest|${ROLLBACK_TEST_IMAGE}|g" \
     k8s/rollback-test/deployment.yaml \
     > production-deployment-rendered.yaml
 
