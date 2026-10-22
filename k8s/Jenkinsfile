@@ -303,28 +303,35 @@ print("Staging Smoke Test PASSED")
             }
         }
 
-                stage('Production Smoke Test') {
-            steps {
-                sh '''
-                    set -eu
+        stage('Production Smoke Test') {
+    steps {
+        withCredentials([
+            string(
+                credentialsId: 'production-health-url',
+                variable: 'PRODUCTION_HEALTH_URL'
+            )
+        ]) {
+            sh '''
+                set -eu
 
-                    echo "=== Production Smoke Test ==="
+                echo "=== Production Smoke Test ==="
 
-                    RESPONSE=$(curl --fail --silent --show-error \
-                        --max-time 15 \
-                        http://100.101.165.112:30500/health)
+                RESPONSE=$(curl --fail --silent --show-error \
+                    --max-time 15 \
+                    "${PRODUCTION_HEALTH_URL}")
 
-                    echo "Response: ${RESPONSE}"
+                echo "Response: ${RESPONSE}"
 
-                    if [ "${RESPONSE}" != '{"status":"healthy"}' ]; then
-                        echo "ERROR: Production health response is invalid"
-                        exit 1
-                    fi
+                if [ "${RESPONSE}" != '{"status":"healthy"}' ]; then
+                    echo "ERROR: Production health response is invalid"
+                    exit 1
+                fi
 
-                    echo "Production Smoke Test PASSED"
-                '''
-            }
+                echo "Production Smoke Test PASSED"
+            '''
         }
+    }
+}
     } // Kết thúc stages của Production Release
     post {
         failure {
@@ -333,11 +340,15 @@ print("Staging Smoke Test PASSED")
                     echo 'Production Release FAILED. Attempting image rollback.'
 
                     withCredentials([
-                        file(
-                            credentialsId: 'k3s-jenkins-kubeconfig',
-                            variable: 'KUBECONFIG'
-                        )
-                    ]) {
+    file(
+        credentialsId: 'k3s-jenkins-kubeconfig',
+        variable: 'KUBECONFIG'
+    ),
+    string(
+        credentialsId: 'production-health-url',
+        variable: 'PRODUCTION_HEALTH_URL'
+    )
+]) {
                         sh '''
                             set -eu
 
@@ -372,8 +383,8 @@ print("Staging Smoke Test PASSED")
                             echo "=== Verifying Production health ==="
 
                             RESPONSE=$(curl --fail --silent --show-error \
-                                --max-time 15 \
-                                http://100.101.165.112:30500/health)
+    --max-time 15 \
+    "${PRODUCTION_HEALTH_URL}")
 
                             echo "Response: ${RESPONSE}"
 
