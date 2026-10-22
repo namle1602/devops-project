@@ -149,10 +149,11 @@ pipeline {
 
                         echo "=== Staging Smoke Test ==="
 
-                        POD=$(kubectl get pods \
-                            -n "${STAGING_NS}" \
-                            -l app=flask-app \
-                            -o jsonpath='{.items[0].metadata.name}')
+                        POD=$(kubectl get pods -n "${STAGING_NS}" \
+    -l app=flask-app \
+    --field-selector=status.phase=Running \
+    -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}' \
+    | head -n 1)
 
                         if [ -z "${POD}" ]; then
                             echo "ERROR: No Staging Pod found"
