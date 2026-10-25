@@ -52,7 +52,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -94,7 +94,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -140,7 +140,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -201,7 +201,7 @@ print("Staging Smoke Test PASSED")
                     steps {
                     withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -264,7 +264,7 @@ print("Staging Smoke Test PASSED")
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -341,7 +341,7 @@ print("Staging Smoke Test PASSED")
 
                     withCredentials([
     file(
-        credentialsId: 'k3s-jenkins-kubeconfig',
+        credentialsId: 'azure-k3s-jenkins-kubeconfig',
         variable: 'KUBECONFIG'
     ),
     string(
