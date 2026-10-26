@@ -46,20 +46,101 @@ pipeline {
         }
 
         stage('Push Image to GHCR') {
-            steps {
-                withCredentials([usernamePassword(
-                    credentialsId: 'ghcr-credentials',
-                    usernameVariable: 'GHCR_USER',
-                    passwordVariable: 'GHCR_TOKEN'
-                )]) {
-                    sh '''
-                        echo "${GHCR_TOKEN}" | podman login ghcr.io -u "${GHCR_USER}" --password-stdin
-                        podman --cgroup-manager=cgroupfs push ${FULL_IMAGE}
-                        podman --cgroup-manager=cgroupfs push ${LATEST_IMAGE}
-                    '''
+    steps {
+        withCredentials([usernamePassword(
+            credentialsId: 'ghcr-credentials',
+            usernameVariable: 'GHCR_USER',
+            passwordVariable: 'GHCR_TOKEN'
+        )]) {
+            script {
+                def runGhcrOperation = { String operation, String command ->
+                    int maxAttempts = 3
+
+                    for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+                        echo "${operation}: attempt ${attempt}/${maxAttempts}"
+
+                        // Each attempt uses a private temporary file.
+                        // Never store the GHCR token in the log.
+                        String logFile = sh(
+                            script: '''
+                                set +x
+                                mktemp
+                            ''',
+                            returnStdout: true
+                        ).trim()
+
+                        try {
+                            int exitCode = sh(
+                                script: """#!/bin/sh
+set +x
+${command} > '${logFile}' 2>&1
+""",
+                                returnStatus: true
+                            )
+
+                            if (exitCode == 0) {
+                                echo "${operation}: SUCCESS"
+                                return
+                            }
+
+                            String result = sh(
+                                script: """#!/bin/sh
+set +x
+if grep -Eiq 'unauthorized|authentication required|denied|forbidden|401|403|invalid username|invalid password' '${logFile}'; then
+    echo AUTH
+elif grep -Eiq 'timeout|timed out|connection reset|connection refused|temporary failure|try again|too many requests|429|500|502|503|504|internal server error|bad gateway|service unavailable|gateway timeout' '${logFile}'; then
+    echo TRANSIENT
+else
+    echo PERMANENT
+fi
+""",
+                                returnStdout: true
+                            ).trim()
+
+                            echo "${operation}: exit=${exitCode}, category=${result}"
+
+                            if (result != 'TRANSIENT') {
+                                error "${operation} failed: ${result}"
+                            }
+
+                            if (attempt == maxAttempts) {
+                                error "${operation} failed after ${maxAttempts} attempts"
+                            }
+
+                        } finally {
+                            sh(
+                                script: """#!/bin/sh
+set +x
+rm -f '${logFile}'
+""",
+                                returnStatus: true
+                            )
+                        }
+
+                        echo "${operation}: transient error, retrying in 10 seconds"
+                            sleep time: 10, unit: 'SECONDS'
+
+                    }
                 }
+
+                runGhcrOperation(
+                    'GHCR Login',
+                    '''printf '%s' "$GHCR_TOKEN" | podman login ghcr.io -u "$GHCR_USER" --password-stdin'''
+                )
+
+                runGhcrOperation(
+                    'GHCR Push (versioned)',
+                    'podman --cgroup-manager=cgroupfs push "$FULL_IMAGE"'
+                )
+
+                runGhcrOperation(
+                    'GHCR Push (latest)',
+                    'podman --cgroup-manager=cgroupfs push "$LATEST_IMAGE"'
+                )
             }
         }
+    }
+}
 
         stage('Trigger CD Pipeline') {
             steps {
