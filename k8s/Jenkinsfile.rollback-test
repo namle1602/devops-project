@@ -10,16 +10,22 @@ pipeline {
     }
 
     parameters {
-        string(
-            name: 'IMAGE_TAG',
-            defaultValue: '',
-            description: 'GHCR image tag received from CI'
-        )
-    }
+    string(
+        name: 'IMAGE_TAG',
+        defaultValue: '',
+        description: 'GHCR image tag received from CI'
+    )
+
+    booleanParam(
+        name: 'SIMULATE_PRODUCTION_FAILURE',
+        defaultValue: false,
+        description: 'Simulate a failed deployment in the isolated rollback-test namespace'
+    )
+}
 
     environment {
         IMAGE_REPO = 'ghcr.io/namle1602/devops-flask-app'
-        STAGING_NS = 'devops-staging'
+        STAGING_NS = 'devops-rollback-staging'
         PRODUCTION_NS = 'devops-rollback-test'
     }
 
@@ -52,7 +58,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -94,7 +100,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -105,11 +111,11 @@ pipeline {
                         echo "Image: ${DEPLOY_IMAGE}"
 
                         kubectl apply \
-                            -f k8s/staging/service.yaml \
+                            -f k8s/rollback-test/staging/service.yaml \
                             -n "${STAGING_NS}"
 
                         sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
-                            k8s/staging/deployment.yaml \
+                            k8s/rollback-test/staging/deployment.yaml \
                             > staging-deployment-rendered.yaml
 
                         kubectl apply \
@@ -140,7 +146,7 @@ pipeline {
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -165,7 +171,7 @@ pipeline {
 import urllib.request
 import json
 
-url = "http://flask-service.devops-staging.svc.cluster.local/health"
+url = "http://flask-service.devops-rollback-staging.svc.cluster.local/health"
 
 with urllib.request.urlopen(url, timeout=15) as response:
     status = response.status
@@ -201,7 +207,7 @@ print("Staging Smoke Test PASSED")
                     steps {
                     withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -221,7 +227,16 @@ print("Staging Smoke Test PASSED")
                         '''
 
                         env.PRODUCTION_DEPLOY_STARTED = 'true'
+env.PRODUCTION_TEST_IMAGE = env.DEPLOY_IMAGE
 
+if (params.SIMULATE_PRODUCTION_FAILURE) {
+    env.PRODUCTION_TEST_IMAGE =
+        "${env.IMAGE_REPO}:rollback-test-invalid-20261026"
+
+    echo "SIMULATION ENABLED: ${env.PRODUCTION_TEST_IMAGE}"
+} else {
+    echo "Simulation disabled: ${env.PRODUCTION_TEST_IMAGE}"
+}
                             sh '''
                                 set -eu
 
@@ -231,7 +246,7 @@ print("Staging Smoke Test PASSED")
     -f k8s/rollback-test/service.yaml \
     -n "${PRODUCTION_NS}"
 
-sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
+sed "s|${IMAGE_REPO}:latest|${PRODUCTION_TEST_IMAGE}|g" \
     k8s/rollback-test/deployment.yaml \
     > production-deployment-rendered.yaml
 
@@ -248,7 +263,7 @@ sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
                                     -n "${PRODUCTION_NS}" \
                                     -o jsonpath='{.spec.template.spec.containers[0].image}')
 
-                                if [ "${DEPLOYED_IMAGE}" != "${DEPLOY_IMAGE}" ]; then
+                                if [ "${DEPLOYED_IMAGE}" != "${PRODUCTION_TEST_IMAGE}" ]; then
                                     echo "ERROR: Production image mismatch"
                                     exit 1
                                 fi
@@ -267,7 +282,7 @@ sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
             steps {
                 withCredentials([
                     file(
-                        credentialsId: 'k3s-jenkins-kubeconfig',
+                        credentialsId: 'azure-k3s-jenkins-kubeconfig',
                         variable: 'KUBECONFIG'
                     )
                 ]) {
@@ -310,7 +325,7 @@ sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
     steps {
         withCredentials([
             file(
-                credentialsId: 'k3s-jenkins-kubeconfig',
+                credentialsId: 'azure-k3s-jenkins-kubeconfig',
                 variable: 'KUBECONFIG'
             )
         ]) {
@@ -355,7 +370,7 @@ print("Rollback Test Smoke Test PASSED")
 
                     withCredentials([
                         file(
-                            credentialsId: 'k3s-jenkins-kubeconfig',
+                            credentialsId: 'azure-k3s-jenkins-kubeconfig',
                             variable: 'KUBECONFIG'
                         )
                     ]) {
