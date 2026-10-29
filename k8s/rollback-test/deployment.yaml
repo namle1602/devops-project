@@ -28,6 +28,8 @@ spec:
     metadata:
       labels:
         app: flask-app
+      annotations:
+        devops.example.com/release-id: "RELEASE_ID_PLACEHOLDER"
 
     spec:
       containers:
