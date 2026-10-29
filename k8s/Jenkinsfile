@@ -108,9 +108,11 @@ pipeline {
                             -f k8s/staging/service.yaml \
                             -n "${STAGING_NS}"
 
-                        sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
-                            k8s/staging/deployment.yaml \
-                            > staging-deployment-rendered.yaml
+                        sed \
+    -e "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
+    -e "s|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|g" \
+    k8s/staging/deployment.yaml \
+    > staging-deployment-rendered.yaml
 
                         kubectl apply \
                             -f staging-deployment-rendered.yaml \
@@ -218,6 +220,17 @@ print("Staging Smoke Test PASSED")
 
                             echo "Previous image:"
                             cat production-previous-image.txt
+
+                            echo "=== Saving current Production Pod template ==="
+
+                            kubectl get deployment flask-deployment \
+                                -n "${PRODUCTION_NS}" \
+                                -o jsonpath='{.spec.template}' \
+                                > production-previous-template.json
+
+                            test -s production-previous-template.json
+
+                            echo "Previous Production Pod template saved."
                         '''
 
                         env.PRODUCTION_DEPLOY_STARTED = 'true'
@@ -231,9 +244,11 @@ print("Staging Smoke Test PASSED")
                                     -f k8s/service.yaml \
                                     -n "${PRODUCTION_NS}"
 
-                                sed "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
-                                    k8s/deployment.yaml \
-                                    > production-deployment-rendered.yaml
+                                sed \
+    -e "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
+    -e "s|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|g" \
+    k8s/deployment.yaml \
+    > production-deployment-rendered.yaml
 
                                 kubectl apply \
                                     -f production-deployment-rendered.yaml \
@@ -361,10 +376,32 @@ print("Staging Smoke Test PASSED")
                                 exit 1
                             fi
 
-                            kubectl set image \
-                                deployment/flask-deployment \
-                                "flask-app=${PREVIOUS_IMAGE}" \
-                                -n "${PRODUCTION_NS}"
+                                                        echo "=== Restoring previous Production Pod template ==="
+
+                            test -s production-previous-template.json
+
+python3 - <<'PY'
+import json
+
+with open("production-previous-template.json", encoding="utf-8") as f:
+    template = json.load(f)
+
+patch = [
+    {
+        "op": "replace",
+        "path": "/spec/template",
+        "value": template
+    }
+]
+
+with open("production-rollback-patch.json", "w", encoding="utf-8") as f:
+    json.dump(patch, f)
+PY
+
+                            kubectl patch deployment flask-deployment \
+                                -n "${PRODUCTION_NS}" \
+                                --type=json \
+                                --patch-file production-rollback-patch.json
 
                             kubectl rollout status \
                                 deployment/flask-deployment \
