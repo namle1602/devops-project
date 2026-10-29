@@ -21,6 +21,7 @@ pipeline {
         IMAGE_REPO = 'ghcr.io/namle1602/devops-flask-app'
         STAGING_NS = 'devops-staging'
         PRODUCTION_NS = 'devops-project'
+        STAGING_DEPLOY_STARTED = 'false'
     }
 
     stages {
@@ -32,10 +33,21 @@ pipeline {
                         error('Invalid IMAGE_TAG')
                     }
 
-                    env.DEPLOY_IMAGE =
-                        "${env.IMAGE_REPO}:${params.IMAGE_TAG}"
+env.DEPLOY_IMAGE =
+    "${env.IMAGE_REPO}:${params.IMAGE_TAG}"
 
-                    echo "Image to deploy: ${env.DEPLOY_IMAGE}"
+def safeJobName = env.JOB_NAME
+    .toLowerCase()
+    .replaceAll(/[^a-z0-9-]/, '-')
+    .replaceAll(/-+/, '-')
+    .replaceAll(/^-|-$/, '')
+
+env.STAGING_RELEASE_ID =
+    "${safeJobName}-${env.BUILD_NUMBER}"
+
+echo "Image to deploy: ${env.DEPLOY_IMAGE}"
+echo "Staging Release ID: ${env.STAGING_RELEASE_ID}"
+
                 }
             }
         }
@@ -90,6 +102,8 @@ pipeline {
             }
         }
 
+stage('Staging Release') {
+    stages {
         stage('Deploy to Staging') {
             steps {
                 withCredentials([
@@ -104,36 +118,84 @@ pipeline {
                         echo "=== Deploying to Staging ==="
                         echo "Image: ${DEPLOY_IMAGE}"
 
-                        kubectl apply \
-                            -f k8s/staging/service.yaml \
-                            -n "${STAGING_NS}"
+                        echo "=== Saving previous Staging state ==="
 
-                        sed \
+kubectl get deployment flask-deployment \
+    -n "${STAGING_NS}" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' \
+    > staging-previous-image.txt
+
+kubectl get deployment flask-deployment \
+    -n "${STAGING_NS}" \
+    -o jsonpath='{.spec.template}' \
+    > staging-previous-template.json
+
+test -s staging-previous-image.txt
+test -s staging-previous-template.json
+
+python3 -m json.tool staging-previous-template.json > /dev/null
+
+echo "Previous Staging image: $(cat staging-previous-image.txt)"
+echo "Previous Staging template saved successfully"
+                    '''
+
+
+sh '''
+    set -eu
+
+    echo "=== Applying Staging resources ==="
+
+    kubectl apply \
+        -f k8s/staging/service.yaml \
+        -n "${STAGING_NS}"
+
+sed \
     -e "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
     -e "s|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|g" \
+    -e "s|RELEASE_ID_PLACEHOLDER|${STAGING_RELEASE_ID}|g" \
     k8s/staging/deployment.yaml \
     > staging-deployment-rendered.yaml
 
-                        kubectl apply \
-                            -f staging-deployment-rendered.yaml \
-                            -n "${STAGING_NS}"
+    test -s staging-deployment-rendered.yaml
 
-                        kubectl rollout status \
-                            deployment/flask-deployment \
-                            -n "${STAGING_NS}" \
-                            --timeout=180s
+    if grep -q 'RELEASE_ID_PLACEHOLDER' staging-deployment-rendered.yaml; then
+    echo "ERROR: Staging Release ID placeholder was not replaced"
+    exit 1
+fi
 
-                        DEPLOYED_IMAGE=$(kubectl get deployment flask-deployment \
-                            -n "${STAGING_NS}" \
-                            -o jsonpath='{.spec.template.spec.containers[0].image}')
+    echo "Staging Deployment manifest rendered successfully"
+'''
 
-                        if [ "${DEPLOYED_IMAGE}" != "${DEPLOY_IMAGE}" ]; then
-                            echo "ERROR: Staging image mismatch"
-                            exit 1
-                        fi
+script {
+    env.STAGING_DEPLOY_STARTED = 'true'
+    echo 'Staging Deployment apply starting; rollback protection enabled'
+}
 
-                        echo "Staging image verified: ${DEPLOYED_IMAGE}"
-                    '''
+sh '''
+    set -eu
+
+    echo "=== Applying Staging Deployment ==="
+
+    kubectl apply \
+        -f staging-deployment-rendered.yaml \
+        -n "${STAGING_NS}"
+
+    kubectl rollout status \
+        deployment/flask-deployment \
+        -n "${STAGING_NS}" \
+        --timeout=180s
+
+    DEPLOYED_IMAGE=$(kubectl get deployment flask-deployment \
+        -n "${STAGING_NS}" \
+        -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+    if [ "${DEPLOYED_IMAGE}" != "${DEPLOY_IMAGE}" ]; then
+        echo "ERROR: Staging image mismatch"
+        exit 1
+    fi
+
+    echo "Staging image verified: ${DEPLOYED_IMAGE}"
+'''
                 }
             }
         }
@@ -185,6 +247,158 @@ print("Staging Smoke Test PASSED")
                 }
             }
         }
+    }
+
+            post {
+                unsuccessful {
+                    script {
+                        if (env.STAGING_DEPLOY_STARTED == 'true') {
+                            echo 'Staging release failed. Starting automatic rollback.'
+
+                            withCredentials([
+                                file(
+                                    credentialsId: 'azure-k3s-jenkins-kubeconfig',
+                                    variable: 'KUBECONFIG'
+                                )
+                            ]) {
+                                sh '''
+                                    set -eu
+
+                                    echo "=== Rolling back Staging ==="
+
+                                    test -s staging-previous-image.txt
+                                    test -s staging-previous-template.json
+
+
+echo "=== Checking Staging image before rollback ==="
+
+EXPECTED_IMAGE=$(cat staging-previous-image.txt)
+
+CURRENT_IMAGE=$(kubectl get deployment flask-deployment \
+    -n "${STAGING_NS}" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+echo "Previous image: ${EXPECTED_IMAGE}"
+echo "Pipeline image: ${DEPLOY_IMAGE}"
+echo "Current image: ${CURRENT_IMAGE}"
+
+if [ "${CURRENT_IMAGE}" != "${DEPLOY_IMAGE}" ] &&
+   [ "${CURRENT_IMAGE}" != "${EXPECTED_IMAGE}" ]; then
+    echo "ERROR: Staging image changed outside this deployment."
+    echo "Automatic rollback stopped to avoid overwriting another release."
+    exit 1
+fi
+
+echo "=== Capturing current Staging Pod template ==="
+
+kubectl get deployment flask-deployment \
+    -n "${STAGING_NS}" \
+    -o jsonpath='{.spec.template}' \
+    > staging-current-template.json
+
+test -s staging-current-template.json
+python3 -m json.tool staging-current-template.json > /dev/null
+
+
+echo "=== Checking Staging Release ID ==="
+
+CURRENT_RELEASE_ID=$(python3 - <<'PY'
+import json
+
+with open('staging-current-template.json', encoding='utf-8') as f:
+    template = json.load(f)
+
+annotations = template.get('metadata', {}).get('annotations', {})
+print(annotations.get('devops.example.com/release-id', ''))
+PY
+)
+
+echo "Expected Release ID: ${STAGING_RELEASE_ID}"
+echo "Current Release ID: ${CURRENT_RELEASE_ID}"
+
+if [ "${CURRENT_RELEASE_ID}" != "${STAGING_RELEASE_ID}" ]; then
+    echo "ERROR: Staging release ownership mismatch."
+    echo "Automatic rollback stopped to avoid overwriting another release."
+    echo "Deployment may be unchanged; verify its status manually."
+    exit 1
+fi
+
+python3 - <<'PY'
+import json
+
+with open('staging-previous-template.json', encoding='utf-8') as f:
+    previous_template = json.load(f)
+
+with open('staging-current-template.json', encoding='utf-8') as f:
+    current_template = json.load(f)
+
+patch = [
+    {
+        "op": "test",
+        "path": "/spec/template",
+        "value": current_template
+    },
+    {
+        "op": "replace",
+        "path": "/spec/template",
+        "value": previous_template
+    }
+]
+
+with open('staging-rollback-patch.json', 'w', encoding='utf-8') as f:
+    json.dump(patch, f)
+PY
+
+                                    kubectl patch deployment flask-deployment \
+                                        -n "${STAGING_NS}" \
+                                        --type=json \
+                                        --patch-file staging-rollback-patch.json
+
+                                    kubectl rollout status deployment/flask-deployment \
+                                        -n "${STAGING_NS}" \
+                                        --timeout=180s
+
+                                    EXPECTED_IMAGE=$(cat staging-previous-image.txt)
+
+                                    ACTUAL_IMAGE=$(kubectl get deployment flask-deployment \
+                                        -n "${STAGING_NS}" \
+                                        -o jsonpath='{.spec.template.spec.containers[0].image}')
+
+                                    if [ "${ACTUAL_IMAGE}" != "${EXPECTED_IMAGE}" ]; then
+                                        echo "ERROR: Staging rollback image mismatch"
+                                        exit 1
+                                    fi
+
+                                    echo "=== Verifying Staging health after rollback ==="
+
+kubectl exec deployment/flask-deployment \
+    -n "${STAGING_NS}" \
+    -- python3 -c '
+import json
+import urllib.request
+
+url = "http://flask-service.devops-staging.svc.cluster.local/health"
+
+with urllib.request.urlopen(url, timeout=10) as response:
+    status_code = response.status
+    data = json.load(response)
+
+assert status_code == 200, f"Unexpected HTTP status: {status_code}"
+assert data.get("status") == "healthy", f"Unexpected health response: {data}"
+
+print("Staging rollback health check PASSED")
+'
+
+                                    echo "Staging rollback completed: ${ACTUAL_IMAGE}"
+                                '''
+                            }
+                        } else {
+                            echo 'Staging deployment was not started. Skipping rollback.'
+                        }
+                    }
+                }
+            }
+         }
 
         stage('Approve Production Deployment') {
             steps {
