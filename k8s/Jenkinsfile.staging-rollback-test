@@ -1,4 +1,4 @@
-
+def stagingDeployStarted = false
 pipeline {
     agent {
         label 'ci-agent'
@@ -21,7 +21,6 @@ pipeline {
         IMAGE_REPO = 'ghcr.io/namle1602/devops-flask-app'
         STAGING_NS = 'devops-rollback-test'
         PRODUCTION_NS = 'devops-rollback-test'
-        STAGING_DEPLOY_STARTED = 'false'
     }
 
     stages {
@@ -167,7 +166,7 @@ fi
 '''
 
 script {
-    env.STAGING_DEPLOY_STARTED = 'true'
+    stagingDeployStarted = true
     echo 'Staging Deployment apply starting; rollback protection enabled'
 }
 
@@ -252,7 +251,7 @@ print("Staging Smoke Test PASSED")
             post {
                 unsuccessful {
                     script {
-                        if (env.STAGING_DEPLOY_STARTED == 'true') {
+                        if (stagingDeployStarted) {
                             echo 'Staging release failed. Starting automatic rollback.'
 
                             withCredentials([
