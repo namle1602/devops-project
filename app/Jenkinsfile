@@ -41,15 +41,32 @@ pipeline {
             sh '''
                 set -eu
 
-                COMMIT_SHA=$(git rev-parse HEAD)
+                EXPECTED_SHA=$(git rev-parse HEAD)
 
-                echo "Building image from Git commit: ${COMMIT_SHA}"
+                echo "Building image from Git commit: ${EXPECTED_SHA}"
 
                 podman --cgroup-manager=cgroupfs build \
-                    --build-arg "COMMIT_SHA=${COMMIT_SHA}" \
+                    --no-cache \
+                    --build-arg "COMMIT_SHA=${EXPECTED_SHA}" \
                     -t "${FULL_IMAGE}" \
                     -t "${LATEST_IMAGE}" \
                     .
+
+                ACTUAL_SHA=$(podman image inspect \
+                    "${FULL_IMAGE}" \
+                    --format '{{range .Config.Env}}{{println .}}{{end}}' \
+                    | grep '^COMMIT_SHA=' \
+                    | cut -d= -f2-)
+
+                echo "Expected SHA: ${EXPECTED_SHA}"
+                echo "Image SHA:    ${ACTUAL_SHA}"
+
+                if [ "${ACTUAL_SHA}" != "${EXPECTED_SHA}" ]; then
+                    echo "ERROR: Image Git SHA mismatch"
+                    exit 1
+                fi
+
+                echo "IMAGE_SHA_VERIFIED"
             '''
         }
     }
