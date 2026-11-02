@@ -36,14 +36,24 @@ pipeline {
         }
 
         stage('Build Image with Podman') {
-            steps {
-                dir('app') {
-                    sh '''
-                        podman --cgroup-manager=cgroupfs build -t ${FULL_IMAGE} -t ${LATEST_IMAGE} .
-                    '''
-                }
-            }
+    steps {
+        dir('app') {
+            sh '''
+                set -eu
+
+                COMMIT_SHA=$(git rev-parse HEAD)
+
+                echo "Building image from Git commit: ${COMMIT_SHA}"
+
+                podman --cgroup-manager=cgroupfs build \
+                    --build-arg "COMMIT_SHA=${COMMIT_SHA}" \
+                    -t "${FULL_IMAGE}" \
+                    -t "${LATEST_IMAGE}" \
+                    .
+            '''
         }
+    }
+}
 
         stage('Push Image to GHCR') {
     steps {
