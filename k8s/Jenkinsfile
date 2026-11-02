@@ -1,4 +1,5 @@
 def stagingDeployStarted = false
+def productionDeployStarted = false
 pipeline {
     agent {
         label 'ci-agent'
@@ -43,6 +44,11 @@ def safeJobName = env.JOB_NAME
 
 env.STAGING_RELEASE_ID =
     "${safeJobName}-${env.BUILD_NUMBER}"
+
+    env.PRODUCTION_RELEASE_ID =
+    "${safeJobName}-${env.BUILD_NUMBER}-production"
+
+echo "Production Release ID: ${env.PRODUCTION_RELEASE_ID}"
 
 echo "Image to deploy: ${env.DEPLOY_IMAGE}"
 echo "Staging Release ID: ${env.STAGING_RELEASE_ID}"
@@ -212,17 +218,7 @@ sh '''
 
                         echo "=== Staging Smoke Test ==="
 
-                        POD=$(kubectl get pods -n "${STAGING_NS}" \
-    -l app=flask-app \
-    --field-selector=status.phase=Running \
-    -o jsonpath='{.items[0].metadata.name}')
-
-                        if [ -z "${POD}" ]; then
-                            echo "ERROR: No Staging Pod found"
-                            exit 1
-                        fi
-
-                        kubectl exec "${POD}" \
+                        kubectl exec deployment/flask-deployment \
                             -n "${STAGING_NS}" \
                             -- python -c '
 import urllib.request
@@ -299,6 +295,9 @@ test -s staging-current-template.json
 python3 -m json.tool staging-current-template.json > /dev/null
 
 
+if python3 -c 'import json; a=json.load(open("staging-current-template.json")); b=json.load(open("staging-previous-template.json")); exit(0 if a==b else 1)'; then
+    echo "Staging template unchanged; verify baseline."
+else
 echo "=== Checking Staging Release ID ==="
 
 CURRENT_RELEASE_ID=$(python3 - <<'PY'
@@ -353,6 +352,8 @@ PY
                                         --type=json \
                                         --patch-file staging-rollback-patch.json
 
+fi
+
                                     kubectl rollout status deployment/flask-deployment \
                                         -n "${STAGING_NS}" \
                                         --timeout=180s
@@ -399,17 +400,6 @@ print("Staging rollback health check PASSED")
             }
          }
 
-        stage('Approve Production Deployment') {
-            steps {
-                timeout(time: 15, unit: 'MINUTES') {
-                    input(
-                        message: "Staging passed. Deploy image ${env.DEPLOY_IMAGE} to Production?",
-                        ok: 'Deploy to Production'
-                    )
-                }
-            }
-        }
-
         stage('Production Release') {
             stages {
                 stage('Deploy to Production') {
@@ -446,8 +436,6 @@ print("Staging rollback health check PASSED")
                             echo "Previous Production Pod template saved."
                         '''
 
-                        env.PRODUCTION_DEPLOY_STARTED = 'true'
-
                             sh '''
                                 set -eu
 
@@ -457,12 +445,25 @@ print("Staging rollback health check PASSED")
                                     -f k8s/service.yaml \
                                     -n "${PRODUCTION_NS}"
 
-                                sed \
+sed \
     -e "s|${IMAGE_REPO}:latest|${DEPLOY_IMAGE}|g" \
     -e "s|IMAGE_TAG_PLACEHOLDER|${IMAGE_TAG}|g" \
+    -e "s|RELEASE_ID_PLACEHOLDER|${PRODUCTION_RELEASE_ID}|g" \
     k8s/deployment.yaml \
     > production-deployment-rendered.yaml
 
+test -s production-deployment-rendered.yaml
+
+if grep -q 'RELEASE_ID_PLACEHOLDER' production-deployment-rendered.yaml; then
+    echo "ERROR: Production Release ID placeholder was not replaced"
+    exit 1
+fi
+
+'''
+                            productionDeployStarted = true
+                            echo 'Production apply starting; rollback enabled'
+                            sh '''
+                                set -eu
                                 kubectl apply \
                                     -f production-deployment-rendered.yaml \
                                     -n "${PRODUCTION_NS}"
@@ -481,6 +482,19 @@ print("Staging rollback health check PASSED")
                                     exit 1
                                 fi
 
+                                EXPECTED_IMAGE="${DEPLOY_IMAGE}"
+                                kubectl get pods -n "${PRODUCTION_NS}" -l app=flask-app -o json | EXPECTED_IMAGE="${EXPECTED_IMAGE}" python3 -c '
+import json, os, sys
+pods=json.load(sys.stdin)["items"]
+active=[p for p in pods if not p["metadata"].get("deletionTimestamp")]
+expected=os.environ["EXPECTED_IMAGE"]
+if len(active)!=2: sys.exit("Expected 2 active pods, got %d" % len(active))
+for p in active:
+    images=[c["image"] for c in p["spec"]["containers"] if c["name"]=="flask-app"]
+    ready=any(c.get("type")=="Ready" and c.get("status")=="True" for c in p.get("status",{}).get("conditions",[]))
+    if images!=[expected] or not ready: sys.exit("Pod image/ready mismatch: "+p["metadata"]["name"])
+print("PODS_VERIFIED: 2/2",expected)
+'
                                 echo "Production image verified: ${DEPLOYED_IMAGE}"
                             '''
                         }
@@ -549,13 +563,10 @@ print("Staging rollback health check PASSED")
                     "${PRODUCTION_HEALTH_URL}")
 
                 echo "Response: ${RESPONSE}"
-
-                if [ "${RESPONSE}" != '{"status":"healthy"}' ]; then
-                    echo "ERROR: Production health response is invalid"
-                    exit 1
-                fi
+                printf '%s' "${RESPONSE}" | python3 -c 'import json,sys; assert json.load(sys.stdin).get("status") == "healthy", "Health check failed"'
 
                 echo "Production Smoke Test PASSED"
+                echo "DEPLOY_SUCCESS: ${DEPLOY_IMAGE}"
             '''
         }
     }
@@ -564,7 +575,7 @@ print("Staging rollback health check PASSED")
     post {
         failure {
             script {
-                if (env.PRODUCTION_DEPLOY_STARTED == 'true') {
+                if (productionDeployStarted) {
                     echo 'Production Release FAILED. Attempting image rollback.'
 
                     withCredentials([
@@ -589,32 +600,89 @@ print("Staging rollback health check PASSED")
                                 exit 1
                             fi
 
-                                                        echo "=== Restoring previous Production Pod template ==="
+echo "=== Validating Production rollback ownership ==="
 
-                            test -s production-previous-template.json
+test -s production-previous-template.json
+
+kubectl get deployment flask-deployment \
+    -n "${PRODUCTION_NS}" \
+    -o jsonpath='{.spec.template}' \
+    > production-current-template.json
+
+test -s production-current-template.json
+
+# Temporarily allow Python to return a custom exit code.
+set +e
 
 python3 - <<'PY'
 import json
+import os
+import sys
 
 with open("production-previous-template.json", encoding="utf-8") as f:
-    template = json.load(f)
+    previous = json.load(f)
+
+with open("production-current-template.json", encoding="utf-8") as f:
+    current = json.load(f)
+
+if current == previous:
+    print("Production Pod template unchanged. No rollback required.")
+    sys.exit(10)
+
+expected_release = os.environ["PRODUCTION_RELEASE_ID"]
+expected_image = os.environ["DEPLOY_IMAGE"]
+
+actual_release = (
+    current.get("metadata", {})
+    .get("annotations", {})
+    .get("devops.example.com/release-id", "")
+)
+
+containers = current.get("spec", {}).get("containers", [])
+actual_image = next(
+    (c.get("image", "") for c in containers if c.get("name") == "flask-app"),
+    ""
+)
+
+if actual_release != expected_release:
+    print("ERROR: Production Release ID ownership mismatch")
+    sys.exit(20)
+
+if actual_image != expected_image:
+    print("ERROR: Production image ownership mismatch")
+    sys.exit(21)
 
 patch = [
-    {
-        "op": "replace",
-        "path": "/spec/template",
-        "value": template
-    }
+    {"op": "test", "path": "/spec/template", "value": current},
+    {"op": "replace", "path": "/spec/template", "value": previous}
 ]
 
 with open("production-rollback-patch.json", "w", encoding="utf-8") as f:
     json.dump(patch, f)
+
+print("Production rollback ownership validated.")
 PY
 
-                            kubectl patch deployment flask-deployment \
-                                -n "${PRODUCTION_NS}" \
-                                --type=json \
-                                --patch-file production-rollback-patch.json
+ROLLBACK_CHECK_EXIT=$?
+
+# Restore strict shell error handling.
+set -e
+
+if [ "${ROLLBACK_CHECK_EXIT}" -eq 10 ]; then
+    echo "Production Pod template unchanged; verify baseline."
+elif [ "${ROLLBACK_CHECK_EXIT}" -ne 0 ]; then
+    echo "ERROR: Production rollback validation failed (code ${ROLLBACK_CHECK_EXIT})"
+    exit 1
+fi
+
+if [ "${ROLLBACK_CHECK_EXIT}" -eq 0 ]; then
+echo "=== Applying safe Production rollback ==="
+
+kubectl patch deployment flask-deployment \
+    -n "${PRODUCTION_NS}" \
+    --type=json \
+    --patch-file production-rollback-patch.json
+fi
 
                             kubectl rollout status \
                                 deployment/flask-deployment \
@@ -630,6 +698,19 @@ PY
                                 exit 1
                             fi
 
+                            EXPECTED_IMAGE="${PREVIOUS_IMAGE}"
+                            kubectl get pods -n "${PRODUCTION_NS}" -l app=flask-app -o json | EXPECTED_IMAGE="${EXPECTED_IMAGE}" python3 -c '
+import json, os, sys
+pods=json.load(sys.stdin)["items"]
+active=[p for p in pods if not p["metadata"].get("deletionTimestamp")]
+expected=os.environ["EXPECTED_IMAGE"]
+if len(active)!=2: sys.exit("Expected 2 active pods, got %d" % len(active))
+for p in active:
+    images=[c["image"] for c in p["spec"]["containers"] if c["name"]=="flask-app"]
+    ready=any(c.get("type")=="Ready" and c.get("status")=="True" for c in p.get("status",{}).get("conditions",[]))
+    if images!=[expected] or not ready: sys.exit("Pod image/ready mismatch: "+p["metadata"]["name"])
+print("ROLLBACK_PODS_VERIFIED: 2/2",expected)
+'
                             echo "=== Verifying Production health ==="
 
                             RESPONSE=$(curl --fail --silent --show-error \
@@ -637,13 +718,9 @@ PY
     "${PRODUCTION_HEALTH_URL}")
 
                             echo "Response: ${RESPONSE}"
+                printf '%s' "${RESPONSE}" | python3 -c 'import json,sys; assert json.load(sys.stdin).get("status") == "healthy", "Health check failed"'
 
-                            if [ "${RESPONSE}" != '{"status":"healthy"}' ]; then
-                                echo "ERROR: Production health check failed after rollback"
-                                exit 1
-                            fi
-
-                            echo "Production image rollback verified successfully!"
+                            echo "ROLLBACK_SUCCESS: Production restored to ${PREVIOUS_IMAGE}"
                         '''
                     }
                 } else {
