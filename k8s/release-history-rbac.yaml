@@ -1,0 +1,35 @@
+
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: jenkins-release-history-role
+  namespace: devops-project
+
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - configmaps
+    resourceNames:
+      - flask-release-history
+    verbs:
+      - get
+      - patch
+      - update
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: jenkins-release-history-binding
+  namespace: devops-project
+
+subjects:
+  - kind: ServiceAccount
+    name: jenkins-cd
+    namespace: devops-project
+
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: jenkins-release-history-role
