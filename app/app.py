@@ -1,5 +1,7 @@
 
 import os
+import json
+from pathlib import Path
 from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
@@ -297,6 +299,39 @@ def message():
         "version": APP_VERSION,
         "message": MESSAGE
     }), 200
+
+
+@app.route("/api/releases", methods=["GET"])
+def releases():
+    history_file = Path(
+        os.getenv(
+            "RELEASE_HISTORY_FILE",
+            "/app/release-history/releases.json"
+        )
+    )
+
+    if not history_file.is_file():
+        return jsonify({"releases": []}), 200
+
+    try:
+        with history_file.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if (
+            not isinstance(data, dict)
+            or not isinstance(data.get("releases"), list)
+        ):
+            raise ValueError("Invalid release history format")
+
+        return jsonify({
+            "releases": data["releases"]
+        }), 200
+
+    except (OSError, ValueError, UnicodeError):
+        app.logger.exception("Failed to load release history")
+        return jsonify({
+            "error": "Release history unavailable"
+        }), 503
 
 
 if __name__ == "__main__":
