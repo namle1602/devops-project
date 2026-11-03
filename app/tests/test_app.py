@@ -113,3 +113,12 @@ def test_releases_invalid_json(client, monkeypatch, tmp_path):
 
     assert response.status_code == 503
     assert response.get_json()["error"] == "Release history unavailable"
+
+
+def test_dashboard_release_history_integration(client):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b'id="release-history"' in response.data
+    assert b'fetch("/api/releases")' in response.data
+    assert b"loadReleaseHistory" in response.data

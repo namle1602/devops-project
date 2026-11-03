@@ -21,6 +21,34 @@ HTML = """
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>DevOps Release Tracker</title>
     <style>
+    
+.release-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 14px;
+}
+
+.release-table th,
+.release-table td {
+    padding: 14px 12px;
+    border-bottom: 1px solid var(--border);
+    text-align: left;
+}
+
+.release-table th {
+    color: var(--muted);
+    font-size: 12px;
+    font-weight: 600;
+}
+
+.release-table tbody tr:hover {
+    background: var(--bg);
+}
+
+#release-history {
+    overflow-x: auto;
+}
+
         :root {
             --bg: #f4f7fc;
             --surface: #ffffff;
@@ -249,9 +277,10 @@ HTML = """
 
         <section class="card">
             <h2>Release History</h2>
-            <div class="history-empty">
-                Release history is not connected yet.
-                <p>Verified deployment records will appear here.</p>
+            <div id="release-history" aria-live="polite">
+                <div class="history-empty">
+                    Loading release history...
+                </div>
             </div>
 
             <nav class="api-links" aria-label="Application APIs">
@@ -263,6 +292,87 @@ HTML = """
     </main>
 
     <footer>DevOps Release Tracker · Application Dashboard</footer>
+
+<script>
+    async function loadReleaseHistory() {
+        const container = document.getElementById("release-history");
+
+        try {
+            const response = await fetch("/api/releases");
+
+            if (!response.ok) {
+                throw new Error("Release history API unavailable");
+            }
+
+            const data = await response.json();
+
+            if (!Array.isArray(data.releases)) {
+                throw new Error("Invalid release history response");
+            }
+
+            if (data.releases.length === 0) {
+                container.innerHTML =
+                    '<div class="history-empty">' +
+                    'No release history available yet.' +
+                    '</div>';
+                return;
+            }
+
+            const table = document.createElement("table");
+            table.className = "release-table";
+
+            const header = document.createElement("thead");
+            const headerRow = document.createElement("tr");
+
+            ["Version", "Git Commit", "Deployed At", "Status"]
+                .forEach(label => {
+                    const th = document.createElement("th");
+                    th.textContent = label;
+                    headerRow.appendChild(th);
+                });
+
+            header.appendChild(headerRow);
+            table.appendChild(header);
+
+            const body = document.createElement("tbody");
+
+            data.releases.forEach(release => {
+                const row = document.createElement("tr");
+
+                const values = [
+                    "v" + (release.version ?? "Unknown"),
+                    release.commit
+                        ? String(release.commit).slice(0, 10)
+                        : "Unknown",
+                    release.deployed_at ?? "Not recorded",
+                    release.status ?? "Unknown"
+                ];
+
+                values.forEach(value => {
+                    const td = document.createElement("td");
+                    td.textContent = value;
+                    row.appendChild(td);
+                });
+
+                body.appendChild(row);
+            });
+
+            table.appendChild(body);
+            container.replaceChildren(table);
+
+        } catch (error) {
+            console.error("Release history error:", error);
+
+            container.innerHTML =
+                '<div class="history-empty">' +
+                'Unable to load release history.' +
+                '</div>';
+        }
+    }
+
+    document.addEventListener("DOMContentLoaded", loadReleaseHistory);
+</script>
+
 </body>
 </html>
 """
