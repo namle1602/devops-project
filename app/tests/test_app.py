@@ -50,3 +50,75 @@ def test_message_endpoint(client):
     data = response.get_json()
     assert "version" in data
     assert data["message"] == "Welcome to DevOps Release Tracker!"
+
+
+def test_dashboard_sections(client):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"Release Overview" in response.data
+    assert b"Current Release Details" in response.data
+    assert b"Release History" in response.data
+    assert b"Release Info API" in response.data
+
+
+def test_releases_empty(client, monkeypatch, tmp_path):
+    missing = tmp_path / "missing.json"
+    monkeypatch.setenv("RELEASE_HISTORY_FILE", str(missing))
+
+    response = client.get("/api/releases")
+
+    assert response.status_code == 200
+    assert response.get_json() == {"releases": []}
+
+
+def test_releases_with_data(client, monkeypatch, tmp_path):
+    import json
+
+    history_file = tmp_path / "releases.json"
+    history = {
+        "schema_version": 1,
+        "releases": [
+            {
+                "version": "32",
+                "commit": "869301038286ac0dbee106391aa32d8d07c1dacf",
+                "image": "ghcr.io/namle1602/devops-flask-app:32",
+                "environment": "production",
+                "status": "success",
+                "deployed_at": None,
+                "cd_build": 24
+            }
+        ]
+    }
+
+    history_file.write_text(
+        json.dumps(history), encoding="utf-8"
+    )
+    monkeypatch.setenv("RELEASE_HISTORY_FILE", str(history_file))
+
+    response = client.get("/api/releases")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["releases"]) == 1
+    assert data["releases"][0]["version"] == "32"
+
+
+def test_releases_invalid_json(client, monkeypatch, tmp_path):
+    history_file = tmp_path / "releases.json"
+    history_file.write_text("{invalid json", encoding="utf-8")
+    monkeypatch.setenv("RELEASE_HISTORY_FILE", str(history_file))
+
+    response = client.get("/api/releases")
+
+    assert response.status_code == 503
+    assert response.get_json()["error"] == "Release history unavailable"
+
+
+def test_dashboard_release_history_integration(client):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b'id="release-history"' in response.data
+    assert b'fetch("/api/releases")' in response.data
+    assert b"loadReleaseHistory" in response.data

@@ -65,3 +65,16 @@ spec:
             periodSeconds: 10
             timeoutSeconds: 2
             failureThreshold: 3
+
+          volumeMounts:
+            - name: release-history
+              mountPath: /app/release-history
+              readOnly: true
+
+      volumes:
+        - name: release-history
+          configMap:
+            name: flask-release-history
+            items:
+              - key: releases.json
+                path: releases.json

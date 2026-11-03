@@ -571,6 +571,34 @@ print("PODS_VERIFIED: 2/2",expected)
         }
     }
 }
+
+stage('Record Production Release') {
+    steps {
+        catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+            withCredentials([
+                file(
+                    credentialsId: 'azure-k3s-jenkins-kubeconfig',
+                    variable: 'KUBECONFIG'
+                )
+            ]) {
+                withEnv([
+                    'PRODUCTION_INFO_URL=https://xdevopszzz.duckdns.org/api/info'
+                ]) {
+                    sh '''
+                        set -eu
+
+                        echo "=== Recording Production Release ==="
+
+                        python3 k8s/scripts/record_release.py
+
+                        echo "=== Release History Updated ==="
+                    '''
+                }
+            }
+        }
+    }
+}
+
     } // Kết thúc stages của Production Release
     post {
         failure {
