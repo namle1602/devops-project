@@ -50,3 +50,13 @@ def test_message_endpoint(client):
     data = response.get_json()
     assert "version" in data
     assert data["message"] == "Welcome to DevOps Release Tracker!"
+
+
+def test_dashboard_sections(client):
+    response = client.get("/")
+
+    assert response.status_code == 200
+    assert b"Release Overview" in response.data
+    assert b"Current Release Details" in response.data
+    assert b"Release History" in response.data
+    assert b"Release Info API" in response.data
