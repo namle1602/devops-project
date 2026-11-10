@@ -67,7 +67,7 @@ HTML = """
             color: var(--text);
             font-family: Arial, Helvetica, sans-serif;
             line-height: 1.5;
-            background-color: #E8F5E9;
+            background-color: #E3F2FD;
         }
 
         .container {
