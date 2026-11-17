@@ -10,7 +10,7 @@ APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 APP_ENV = os.getenv("APP_ENV", "development")
 COMMIT_SHA = os.getenv("COMMIT_SHA", "local")
 
-MESSAGE = "Welcome to DevOps Release Tracker!"
+MESSAGE = "Welcome to DevOps Release Tracker! [DEMO-FAIL]"
 
 
 HTML = """
@@ -67,7 +67,7 @@ HTML = """
             color: var(--text);
             font-family: Arial, Helvetica, sans-serif;
             line-height: 1.5;
-            background-color: #E3F2FD;
+            background-color: #E8F5E9;
         }
 
         .container {
