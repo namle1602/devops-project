@@ -1,0 +1,507 @@
+def uc03(String action) {
+    withCredentials([file(credentialsId: 'uc03-safe-rollback-kubeconfig', variable: 'KUBECONFIG')]) {
+        withEnv(["UC03_ACTION=${action}"]) {
+            sh label: "UC03: ${action}", script: 'set +x; python3 .uc03-demo.py "$UC03_ACTION"'
+        }
+    }
+}
+pipeline {
+    agent { label 'ci-agent' }
+    options {
+        disableConcurrentBuilds()
+        disableRestartFromStage()
+        skipDefaultCheckout()
+        timestamps()
+        timeout(time: 25, unit: 'MINUTES')
+    }
+    parameters {
+        booleanParam(name: 'RUN_SIMULATION', defaultValue: false,
+                     description: 'Chỉ bật sau khi cô lập workload thử và được phê duyệt.')
+    }
+    stages {
+        stage('Preflight & Safety Validation') {
+            options { timeout(time: 3, unit: 'MINUTES') }
+            steps {
+                writeFile file: '.uc03-demo.py', text: '''
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import secrets
+import subprocess
+import sys
+import time
+NS = "devops-rollback-test"
+CONTEXT = "uc03-safe-rollback-demo"
+# Endpoint reported in W-CD; confirm private route and CA/SAN before controlled setup.
+SERVER = "https://10.10.1.5:6443"
+IDENTITY = "system:serviceaccount:devops-rollback-test:uc03-safe-rollback-demo"
+DEP = "flask-deployment"
+SVC = "flask-service"
+PROXY_NAME = SVC + ":http"
+APP = "flask-app"
+IMAGE = "example.invalid/uc03/intentional-failure:never-pull"
+MARK = "devops.example.com/uc03-owner"
+MARK_PATH = "/metadata/annotations/devops.example.com~1uc03-owner"
+
+class SafetyError(Exception):
+    pass
+
+def need(condition, reason):
+    if not condition:
+        raise SafetyError(reason)
+
+def call(*args, limited=False, input_text=None):
+    command = ["kubectl", "--kubeconfig", os.environ["KUBECONFIG"], "--request-timeout=8s"]
+    if not limited:
+        command += ["--context", CONTEXT, "-n", NS]
+    # A Jenkins agent can inherit a proxy unrelated to the approved private route.
+    environment = {k: v for k, v in os.environ.items()
+                   if k.lower() not in ("http_proxy", "https_proxy", "all_proxy")}
+    return subprocess.run(command + list(args), input=input_text, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, text=True, timeout=10, env=environment)
+
+def read(*args, limited=False):
+    result = call(*args, limited=limited)
+    need(result.returncode == 0, "kubectl " + args[0] + " failed; check authorized access.")
+    return result.stdout.strip()
+
+def config(expression):
+    return read("config", "view", "--minify", "-o", "jsonpath=" + expression, limited=True)
+
+def identity():
+    need(read("config", "current-context", limited=True) == CONTEXT, "Wrong context.")
+    need(config("{.contexts[0].context.namespace}") == NS, "Wrong namespace in context.")
+    need(config("{.clusters[0].cluster.server}") == SERVER, "Unexpected API endpoint.")
+    need(config("{.clusters[0].cluster.insecure-skip-tls-verify}") in ("", "false"),
+         "TLS verification is required.")
+    need(not config("{.clusters[0].cluster.proxy-url}"), "Unexpected kubeconfig proxy.")
+    need(not config("{.clusters[0].cluster.tls-server-name}"), "Unexpected TLS server-name override.")
+    need(config("{.clusters[0].cluster.certificate-authority-data}")
+         or config("{.clusters[0].cluster.certificate-authority}"), "Explicit API CA is required.")
+    need(not config("{.users[0].user.exec.command}") and not config("{.users[0].user.auth-provider.name}"),
+         "Unexpected external authentication plugin in kubeconfig.")
+    user = json.loads(read("auth", "whoami", "-o", "json"))["status"]["userInfo"]
+    need(user["username"] == IDENTITY and "system:masters" not in user.get("groups", []),
+         "Wrong Kubernetes identity.")
+
+def permitted(expected, verb, group, resource, namespace, name="", subresource=""):
+    attributes = {"namespace": namespace, "verb": verb, "group": group, "resource": resource}
+    if name:
+        attributes["name"] = name
+    if subresource:
+        attributes["subresource"] = subresource
+    # This virtual API evaluates authorization; it does not persist or mutate a workload.
+    review = {"apiVersion": "authorization.k8s.io/v1", "kind": "SelfSubjectAccessReview",
+              "spec": {"resourceAttributes": attributes}}
+    result = call("create", "--raw", "/apis/authorization.k8s.io/v1/selfsubjectaccessreviews",
+                  "-f", "-", input_text=json.dumps(review))
+    status = json.loads(result.stdout)["status"] if result.returncode == 0 else {}
+    need(not status.get("evaluationError") and status.get("allowed") is expected
+         and not (expected and status.get("denied")),
+         "Permission check failed or unexpected result: " + verb + " " + resource + " in " + namespace)
+
+def check_permissions():
+    for verb, group, resource, name, subresource in (
+        ("patch", "apps", "deployments", DEP, ""), ("get", "apps", "deployments", DEP, ""),
+        ("get", "", "services", SVC, ""), ("get", "", "services", PROXY_NAME, "proxy"),
+        ("list", "apps", "replicasets", "", ""), ("list", "", "pods", "", ""),
+        ("list", "discovery.k8s.io", "endpointslices", "", ""),
+    ):
+        permitted(True, verb, group, resource, NS, name, subresource)
+    for namespace in ("devops-project", "devops-staging", "devops-rollback-staging"):
+        for verb in ("patch", "update", "delete"):
+            permitted(False, verb, "apps", "deployments", namespace, DEP)
+        permitted(False, "create", "apps", "deployments", namespace)
+        permitted(False, "patch", "", "services", namespace, SVC)
+    for verb, group, resource, name, subresource in (
+        ("create", "apps", "deployments", "", ""), ("patch", "apps", "deployments", "uc03-other", ""),
+        ("update", "apps", "deployments", DEP, ""), ("delete", "apps", "deployments", DEP, ""),
+        ("patch", "apps", "deployments", DEP, "scale"), ("patch", "", "services", SVC, ""),
+        ("get", "", "secrets", "", ""), ("list", "", "secrets", "", ""),
+        ("create", "", "pods", "", "exec"), ("get", "", "services", "uc03-other:http", "proxy"),
+    ):
+        permitted(False, verb, group, resource, NS, name, subresource)
+
+def preflight():
+    check_permissions()
+    snapshot()
+    print("Preflight PASS: identity, target, sampled permissions and baseline health.")
+
+def deployment():
+    obj = json.loads(read("get", "deployment", DEP, "-o", "json"))
+    need(obj["metadata"]["namespace"] == NS and obj["metadata"]["name"] == DEP,
+         "Deployment identity mismatch.")
+    return obj
+
+def stable_hash(value):
+    data = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(data).hexdigest()
+
+def app_container(obj):
+    containers = obj["spec"]["template"]["spec"]["containers"]
+    matches = [(i, c) for i, c in enumerate(containers) if c["name"] == APP]
+    need(len(matches) == 1, "Expected exactly one Flask container.")
+    return matches[0]
+
+def owned(obj, kind, uid):
+    return any(r.get("controller") and r["kind"] == kind and r["uid"] == uid
+               for r in obj["metadata"].get("ownerReferences", []))
+
+def pods_for(d):
+    selector = "app=flask-app"
+    rs = json.loads(read("get", "replicasets", "-l", selector, "-o", "json"))["items"]
+    uids = {r["metadata"]["uid"] for r in rs if owned(r, "Deployment", d["metadata"]["uid"])}
+    pods = json.loads(read("get", "pods", "-l", selector, "-o", "json"))["items"]
+    active = [p for p in pods if not p["metadata"].get("deletionTimestamp")]
+    need(all(any(owned(p, "ReplicaSet", uid) for uid in uids) for p in active),
+         "Service selector includes Pods outside the target Deployment.")
+    return active
+
+def service():
+    svc = json.loads(read("get", "service", SVC, "-o", "json"))
+    spec = svc["spec"]
+    need(svc["metadata"]["namespace"] == NS and svc["metadata"]["name"] == SVC
+         and spec.get("type") == "ClusterIP" and spec.get("selector") == {"app": APP},
+         "Unexpected Service selection.")
+    ports = spec["ports"]
+    need(len(ports) == 1 and ports[0].get("protocol") == "TCP" and ports[0]["port"] == 80
+         and ports[0]["targetPort"] == 5000 and ports[0].get("name") == "http", "Unexpected Service ports.")
+    return svc["metadata"]["uid"], stable_hash(spec)
+
+def ready_endpoints(d):
+    expected = {p["metadata"]["uid"]: p["status"]["podIP"] for p in pods_for(d)}
+    slices = json.loads(read("get", "endpointslices",
+                            "-l", "kubernetes.io/service-name=" + SVC, "-o", "json"))["items"]
+    service_uid, _ = service()
+    found = {}
+    for item in slices:
+        need(any(r["kind"] == "Service" and r["uid"] == service_uid
+                 for r in item["metadata"].get("ownerReferences", [])),
+             "EndpointSlice ownership mismatch.")
+        if item["endpoints"]:
+            need(any(p.get("port") == 5000 and p.get("protocol") == "TCP"
+                     for p in item["ports"]), "EndpointSlice backend port mismatch.")
+        for endpoint in item["endpoints"]:
+            if not endpoint.get("conditions", {}).get("ready"):
+                continue
+            ref = endpoint.get("targetRef", {})
+            uid = ref.get("uid")
+            need(ref.get("kind") == "Pod" and ref.get("namespace") == NS and uid in expected
+                 and expected[uid] in endpoint["addresses"], "Unexpected ready endpoint.")
+            found[uid] = expected[uid]
+    need(found == expected and len(found) == d["spec"]["replicas"],
+         "Ready endpoints do not match the target Pods.")
+
+
+def health():
+    path = "/api/v1/namespaces/" + NS + "/services/" + PROXY_NAME + "/proxy/health"
+    need(json.loads(read("get", "--raw", path)) == {"status": "healthy"},
+         "Internal Service health response mismatch.")
+
+def wait_for(seconds, check, reason):
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        result = check()
+        if result is not None:
+            return result
+        time.sleep(3)
+    raise SafetyError(reason)
+
+def verified_pods(d, ref):
+    spec = d["spec"]
+    status = d.get("status", {})
+    replicas = spec["replicas"]
+    if not (status.get("observedGeneration") == d["metadata"]["generation"]
+            and all(status.get(k) == replicas for k in
+                    ("readyReplicas", "availableReplicas", "updatedReplicas", "replicas"))):
+        return None
+    pods = pods_for(d)
+    if len(pods) != replicas:
+        return None
+    digests = []
+    for pod in pods:
+        conditions = pod["status"].get("conditions", [])
+        containers = [c for c in pod["status"].get("containerStatuses", []) if c["name"] == APP]
+        images = [c["image"] for c in pod["spec"]["containers"] if c["name"] == APP]
+        if not (any(c["type"] == "Ready" and c["status"] == "True" for c in conditions)
+                and images == [ref] and len(containers) == 1 and containers[0]["ready"]):
+            return None
+        image_id = containers[0].get("imageID", "")
+        _, sep, digest = image_id.rpartition("sha256:")
+        need(sep and len(digest) == 64 and all(c in "0123456789abcdef" for c in digest),
+             "Missing usable digest for Ready Pod.")
+        digests.append("sha256:" + digest)
+    need(len(set(digests)) == 1, "Baseline or recovery Pods have diverging digests.")
+    return digests[0]
+
+def annotation(d):
+    return (d["metadata"].get("annotations") or {}).get(MARK)
+
+def snapshot():
+    d = deployment()
+    md = d["metadata"]
+    idx, container = app_container(d)
+    ref = container["image"]
+    need(d["spec"]["replicas"] >= 1 and annotation(d) is None, "Target busy or scaled to zero.")
+    need(ref.startswith("ghcr.io/namle1602/devops-flask-app:")
+         and ref.rsplit(":", 1)[-1] not in ("latest", "")
+         and "@" not in ref, "Expected an explicit versioned Flask image tag.")
+    need(container["imagePullPolicy"] in ("Always", "IfNotPresent", "Never"),
+         "Unexpected baseline pull policy.")
+    svc = service()
+    digest = verified_pods(d, ref)
+    need(digest is not None, "Baseline is not fully available.")
+    ready_endpoints(d)
+    health()
+    after = deployment()
+    need(after["metadata"]["uid"] == md["uid"]
+         and after["metadata"]["generation"] == md["generation"]
+         and stable_hash(after["spec"]) == stable_hash(d["spec"])
+         and annotation(after) is None and service() == svc,
+         "Baseline changed during verification.")
+    return {"uid": md["uid"], "generation": md["generation"], "index": idx,
+            "specHash": stable_hash(d["spec"]), "templateHash": stable_hash(d["spec"]["template"]),
+            "image": ref, "policy": container["imagePullPolicy"], "imageIDDigest": digest,
+            "replicas": d["spec"]["replicas"], "ready": d["spec"]["replicas"],
+            "service": list(svc), "health": "healthy"}
+
+def file(name):
+    return directory / (name + ".json")
+
+def save(name, obj):
+    target = file(name)
+    temp = target.with_suffix(".tmp")
+    with temp.open("x", encoding="utf-8") as handle:
+        json.dump(obj, handle, indent=2)
+    temp.replace(target)
+
+def load(name):
+    return json.loads(file(name).read_text(encoding="utf-8"))
+
+def same_baseline(d, base):
+    return (d["metadata"]["uid"] == base["uid"] and stable_hash(d["spec"]) == base["specHash"]
+            and annotation(d) is None)
+
+def fields(index):
+    path = "/spec/template/spec/containers/" + str(index)
+    return path + "/image", path + "/imagePullPolicy"
+
+def operation(op, path, value):
+    return {"op": op, "path": path, "value": value}
+
+def patch(d, edits):
+    md = d["metadata"]
+    checks = [operation("test", "/metadata/uid", md["uid"]),
+              operation("test", "/metadata/resourceVersion", md["resourceVersion"])]
+    # Only the whitelisted scalar changes enter argv. No full template or Secret is persisted.
+    result = call("patch", "deployment", DEP, "--type=json", "-p", json.dumps(checks + edits),
+                  "-o", "name")
+    need(result.returncode == 0, "Patch unacknowledged or rejected; inspect ownership before recovery.")
+
+def marker_edit(d, owner):
+    if d["metadata"].get("annotations") is None:
+        return operation("add", "/metadata/annotations", {MARK: owner})
+    return operation("add", MARK_PATH, owner)
+
+def simulate():
+    check_permissions()
+    base = load("baseline")
+    need(snapshot() == base, "Baseline differs after approval; stop before mutation.")
+    d = deployment()
+    need(same_baseline(d, base) and d["metadata"]["generation"] == base["generation"],
+         "Pre-write guard rejected changed Deployment.")
+    image_path, policy_path = fields(base["index"])
+    intended = copy.deepcopy(d["spec"])
+    container = intended["template"]["spec"]["containers"][base["index"]]
+    container["image"] = IMAGE
+    container["imagePullPolicy"] = "Never"
+    owner = "uc03-" + os.environ["BUILD_NUMBER"] + "-" + secrets.token_hex(8)
+    intent = {"owner": owner, "specHash": stable_hash(intended), "generation": base["generation"] + 1}
+    save("intent", intent)
+    patch(d, [marker_edit(d, owner),
+              operation("replace", image_path, IMAGE), operation("replace", policy_path, "Never")])
+    print("SIMULATED: one Deployment template changed; waiting for ErrImageNeverPull.")
+    def failure():
+        current = deployment()
+        require_owned(current, base, intent)
+        for pod in pods_for(current):
+            if not any(c["name"] == APP and c["image"] == IMAGE for c in pod["spec"]["containers"]):
+                continue
+            for c in pod.get("status", {}).get("containerStatuses", []):
+                if (c["name"] == APP and c.get("state", {}).get("waiting", {}).get("reason")
+                        == "ErrImageNeverPull"):
+                    return pod["metadata"]["name"]
+        return None
+    pod = wait_for(100, failure, "Expected ErrImageNeverPull was not observed.")
+    save("failed-deployment", {"image": IMAGE, "pod": pod, "reason": "ErrImageNeverPull"})
+    print("FAILED DEPLOYMENT (expected): ErrImageNeverPull on the simulated Pod.")
+
+def require_owned(d, base, intent):
+    need(d["metadata"]["uid"] == base["uid"] and d["metadata"]["generation"] == intent["generation"]
+         and annotation(d) == intent["owner"] and stable_hash(d["spec"]) == intent["specHash"],
+         "Ownership or spec changed; rollback refused.")
+
+def rollback():
+    base, intent = load("baseline"), load("intent")
+    d = deployment()
+    require_owned(d, base, intent)
+    image_path, policy_path = fields(base["index"])
+    patch(d, [operation("test", MARK_PATH, intent["owner"]),
+              operation("replace", image_path, base["image"]),
+              operation("replace", policy_path, base["policy"]),
+              {"op": "remove", "path": MARK_PATH}])
+    save("rollback-ack", {"generation": intent["generation"] + 1})
+    print("ROLLBACK: restored image and pull policy; removed this build's marker.")
+
+def verify():
+    base, intent = load("baseline"), load("intent")
+    def recovered():
+        d = deployment()
+        need(same_baseline(d, base) and d["metadata"]["generation"] == intent["generation"] + 1,
+             "Restored Deployment differs from the owned baseline.")
+        digest = verified_pods(d, base["image"])
+        if digest:
+            need(digest == base["imageIDDigest"], "Restored tag resolved to a different digest.")
+        return digest
+    digest = wait_for(170, recovered, "Recovered rollout did not become Ready within budget.")
+    need(list(service()) == base["service"], "Service changed during the demonstration.")
+    ready_endpoints(deployment())
+    health()
+    need(recovered() == digest and list(service()) == base["service"],
+         "Recovery changed while verifying health.")
+    save("restored", {"image": base["image"], "imageIDDigest": digest, "ready": base["replicas"],
+                      "templateHash": base["templateHash"], "health": "healthy"})
+    print("RESTORED: same image and digest, all replicas Ready, internal Service /health healthy.")
+
+def reconcile():
+    base, intent = load("baseline"), load("intent")
+
+    def visible():
+        d = deployment()
+        if same_baseline(d, base):
+            generation = d["metadata"]["generation"]
+            need(generation in (base["generation"], intent["generation"] + 1),
+                 "Unexpected baseline generation; manual investigation required.")
+            return "restored" if generation == intent["generation"] + 1 else None
+        require_owned(d, base, intent)
+        return "owned"
+
+    state = wait_for(18, visible, "Write outcome still unknown; keep target isolated and inspect manually.")
+    if state == "owned":
+        try:
+            rollback()
+        except (SafetyError, subprocess.TimeoutExpired):
+            need(wait_for(18, lambda: visible() == "restored" or None,
+                          "Rollback not confirmed; manual investigation required."),
+                 "Rollback not confirmed.")
+    verify()
+    save("recovery-reconciled", {"health": "healthy", "exercise": "not-pass"})
+    print("RECOVERY OBSERVED after an unsuccessful or interrupted run; exercise is not PASS.")
+
+def main(action):
+    identity()
+    if action == "preflight":
+        directory.mkdir(mode=0o700, parents=True, exist_ok=False)
+        preflight()
+    elif action == "baseline":
+        base = snapshot()
+        save("baseline", base)
+        print("BEFORE: " + json.dumps({k: base[k] for k in
+                                      ("image", "imageIDDigest", "ready", "templateHash", "health")}))
+    elif action == "simulate":
+        simulate()
+    elif action == "rollback":
+        rollback()
+    elif action == "verify":
+        need(file("failed-deployment").exists() and file("rollback-ack").exists(),
+             "Missing expected failure or acknowledged rollback from this build.")
+        verify()
+    elif action == "fallback":
+        if file("intent").exists() and not file("restored").exists():
+            reconcile()
+    else:
+        raise SafetyError("Unknown action.")
+
+if __name__ == "__main__":
+    build = os.environ["BUILD_NUMBER"]
+    need(build.isdecimal(), "Invalid build number.")
+    directory = Path("uc03-output") / build
+    os.umask(0o077)
+    try:
+        main(sys.argv[1])
+    except SafetyError as e:
+        print("UC03 FAIL CLOSED: " + str(e), file=sys.stderr)
+        sys.exit(1)
+    except (OSError, KeyError, ValueError, subprocess.TimeoutExpired):
+        print("UC03: observation failed; no raw API data printed.", file=sys.stderr)
+        sys.exit(1)
+'''
+                script {
+                    env.UC03_PREFLIGHT_OK = 'false'
+                    uc03('preflight')
+                    env.UC03_PREFLIGHT_OK = 'true'
+                }
+            }
+        }
+        stage('Capture Healthy Baseline') {
+            options { timeout(time: 2, unit: 'MINUTES') }
+            steps { script { uc03('baseline') } }
+        }
+        stage('Approve Isolated Demo') {
+            when { beforeOptions true; expression { params.RUN_SIMULATION } }
+            options { timeout(time: 2, unit: 'MINUTES') }
+            steps {
+                input message: 'Confirm other writers are paused and the demo target is devops-rollback-test.',
+                      ok: 'Start isolated exercise'
+            }
+        }
+        stage('Simulate Failed Deployment') {
+            when { expression { params.RUN_SIMULATION } }
+            options { timeout(time: 4, unit: 'MINUTES') }
+            steps { script { uc03('simulate') } }
+        }
+        stage('Automatic Rollback') {
+            when { expression { params.RUN_SIMULATION } }
+            options { timeout(time: 1, unit: 'MINUTES') }
+            steps { script { uc03('rollback') } }
+        }
+        stage('Verify Recovery') {
+            when { expression { params.RUN_SIMULATION } }
+            options { timeout(time: 4, unit: 'MINUTES') }
+            steps { script { uc03('verify') } }
+        }
+        stage('Report Demo Result') {
+            steps {
+                script {
+                    if (params.RUN_SIMULATION) {
+                        echo 'EXERCISE PASS: expected deployment failure and verified recovery.'
+                    } else {
+                        echo 'READ-ONLY PASS: no simulation or recovery was executed.'
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            script {
+                String dir = "uc03-output/${env.BUILD_NUMBER}"
+                try {
+                    if (env.UC03_PREFLIGHT_OK == 'true' && params.RUN_SIMULATION &&
+                        fileExists("${dir}/intent.json") && !fileExists("${dir}/restored.json")) {
+                        timeout(time: 5, unit: 'MINUTES') { uc03('fallback') }
+                    }
+                } finally {
+                    if (env.UC03_PREFLIGHT_OK == 'true') {
+                        def evidence = ['baseline', 'intent', 'failed-deployment', 'rollback-ack',
+                                        'restored', 'recovery-reconciled']
+                        archiveArtifacts artifacts: evidence.collect { "${dir}/${it}.json" }.join(','),
+                                         allowEmptyArchive: true, followSymlinks: false
+                    }
+                }
+            }
+        }
+    }
+}
