@@ -10,7 +10,7 @@ APP_VERSION = os.getenv("APP_VERSION", "1.0.0")
 APP_ENV = os.getenv("APP_ENV", "development")
 COMMIT_SHA = os.getenv("COMMIT_SHA", "local")
 
-MESSAGE = "Welcome to DevOps Release Tracker! [DEMO-FAIL]"
+MESSAGE = "Welcome to DevOps Release Tracker!"
 
 
 HTML = """
